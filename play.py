@@ -9,12 +9,21 @@ import os
 import sys
 import argparse
 import torch
+
+# Limit quadrants GPU memory pre-allocation so play can run alongside training
+import quadrants as _qd
+_qd_init_orig = _qd.init
+def _qd_init_patched(**kwargs):
+    kwargs.setdefault('device_memory_GB', 8.0)
+    return _qd_init_orig(**kwargs)
+_qd.init = _qd_init_patched
+
 import genesis as gs
 
-from ppo import ActorCritic
+from ppo import ActorCriticRecurrent
 
 URDF_PATH    = os.path.join(os.path.dirname(__file__), 'robot/urdf/h1.urdf')
-NUM_OBS      = 42
+NUM_OBS      = 41
 NUM_ACTIONS  = 10
 DEFAULT_DOF  = torch.tensor([0.,0.,0.,0.,-0.1,-0.1,0.3,0.3,-0.2,-0.2])
 MOTOR_DOFS   = list(range(6, 16))
@@ -30,9 +39,8 @@ def quat_rotate_inverse(q, v):
     return a - b + c
 
 
-def get_obs(robot, last_action, commands, device):
+def get_obs(robot, last_action, commands, phase, device):
     quat    = robot.get_quat()
-    lin_vel = quat_rotate_inverse(quat, robot.get_vel())
     ang_vel = quat_rotate_inverse(quat, robot.get_ang())
     proj_g  = quat_rotate_inverse(
         quat, torch.tensor([[0., 0., -1.]], device=device)
@@ -41,15 +49,18 @@ def get_obs(robot, last_action, commands, device):
     dof_pos = robot.get_dofs_position(motor_dofs) - DEFAULT_DOF.to(device)
     dof_vel = robot.get_dofs_velocity(motor_dofs)
     cmd_scale = torch.tensor([2., 2., 0.25], device=device)
+    sin_phase = torch.sin(2 * torch.pi * phase).unsqueeze(1)
+    cos_phase = torch.cos(2 * torch.pi * phase).unsqueeze(1)
     obs = torch.cat([
-        lin_vel,
-        ang_vel * 0.25,
-        proj_g,
-        commands * cmd_scale,
-        dof_pos,
-        dof_vel * 0.05,
-        last_action,
-    ], dim=-1)
+        ang_vel * 0.25,         # 3
+        proj_g,                 # 3
+        commands * cmd_scale,   # 3
+        dof_pos,                # 10
+        dof_vel * 0.05,         # 10
+        last_action,            # 10
+        sin_phase,              # 1
+        cos_phase,              # 1
+    ], dim=-1)                  # = 41
     return torch.clamp(obs, -5., 5.)
 
 
@@ -59,6 +70,8 @@ def main():
     parser.add_argument('--steps', type=int, default=600,  help='Simulation steps to record')
     parser.add_argument('--out',   default='videos/play.mp4', help='Output video path')
     parser.add_argument('--vx',    type=float, default=1.0,   help='Commanded forward speed (m/s)')
+    parser.add_argument('--vy',    type=float, default=0.0,   help='Commanded lateral speed (m/s)')
+    parser.add_argument('--yaw',   type=float, default=0.0,   help='Commanded yaw rate (rad/s)')
     parser.add_argument('--cpu',   action='store_true',       help='Use CPU backend')
     args = parser.parse_args()
 
@@ -67,8 +80,8 @@ def main():
     backend = gs.cpu if args.cpu else gs.cuda
 
     # ── Load policy ──────────────────────────────────────────────────────────
-    ac = ActorCritic(NUM_OBS, NUM_ACTIONS).to(device)
-    ckpt = torch.load(args.checkpoint, map_location=device)
+    ac = ActorCriticRecurrent(NUM_OBS, NUM_ACTIONS).to(device)
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=True)
     ac.load_state_dict(ckpt['model'])
     ac.eval()
     print(f"Loaded checkpoint: {args.checkpoint}  "
@@ -87,7 +100,6 @@ def main():
         gs.morphs.URDF(file=URDF_PATH, pos=(0., 0., 1.05))
     )
 
-    # Side-follow camera (updated manually each frame)
     cam = scene.add_camera(
         pos=(0., -3.0, 1.2),
         lookat=(0., 0., 0.9),
@@ -109,36 +121,52 @@ def main():
     robot.set_dofs_position(DEFAULT_DOF.unsqueeze(0).to(device), motor_dofs)
     robot.zero_all_dofs_velocity()
 
-    commands    = torch.tensor([[args.vx, 0., 0.]], device=device)
-    last_action = torch.zeros(1, NUM_ACTIONS, device=device)
+    commands        = torch.tensor([[args.vx, args.vy, 0.]], device=device)
+    last_action     = torch.zeros(1, NUM_ACTIONS, device=device)
+    phase           = torch.zeros(1, device=device)
+    # heading target: 0 = forward (+x), matches training convention
+    heading_target  = torch.tensor([args.yaw], device=device)
+
+    # LSTM hidden state (1 env)
+    hidden = ac.init_hidden(1, device)
 
     # ── Record ───────────────────────────────────────────────────────────────
     import imageio
     frames = []
-    print(f"Recording {args.steps} steps → {args.out}  (vx={args.vx} m/s)")
+    print(f"Recording {args.steps} steps → {args.out}  (vx={args.vx}, vy={args.vy}, heading={args.yaw})")
 
     for step in range(args.steps):
-        obs = get_obs(robot, last_action, commands, device)
+        # Update yaw command from heading error, matching env._update_heading_command()
+        quat    = robot.get_quat()
+        qw, qx, qy, qz = quat[:,0], quat[:,1], quat[:,2], quat[:,3]
+        heading = torch.atan2(2*(qw*qz + qx*qy), 1 - 2*(qy**2 + qz**2))
+        err     = heading_target - heading
+        err     = ((err + 3.14159) % (2 * 3.14159)) - 3.14159
+        yaw_cmd = torch.clamp(0.5 * err, -1., 1.)
+        if torch.norm(commands[0, :2]) < 0.1:
+            yaw_cmd = yaw_cmd * 0.
+        commands[0, 2] = yaw_cmd
+
+        obs = get_obs(robot, last_action, commands, phase, device)
+        phase = (phase + 0.02 / 0.8) % 1.0
 
         with torch.no_grad():
-            action = ac.actor(obs)          # deterministic (mean action)
-        action      = torch.clamp(action, -1., 1.)
-        target      = DEFAULT_DOF.to(device) + action * 0.35
+            action, hidden = ac.act_deterministic(obs, hidden)
+        action = torch.clamp(action, -1., 1.)
+        target = DEFAULT_DOF.to(device) + action * 0.25
 
-        for _ in range(4):                  # 4 sim steps per control step
+        for _ in range(4):
             robot.control_dofs_position(target, motor_dofs)
             scene.step()
 
         last_action = action.clone()
 
-        # Update camera to follow robot from the side
-        rpos = robot.get_pos()[0].cpu().numpy()   # [x, y, z]
+        rpos = robot.get_pos()[0].cpu().numpy()
         cam.set_pose(
-            pos    = (rpos[0],       rpos[1] - 3.0, 1.2),
-            lookat = (rpos[0],       rpos[1],       0.9),
+            pos    = (rpos[0], rpos[1] - 3.0, 1.2),
+            lookat = (rpos[0], rpos[1],        0.9),
         )
 
-        # Render frame
         rgb, _, _, _ = cam.render(rgb=True, depth=False, segmentation=False, normal=False)
         frames.append(rgb)
 
