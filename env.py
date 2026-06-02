@@ -37,8 +37,9 @@ MAX_PUSH_VEL      = 1.5   # m/s
 
 
 class H1WalkingEnv:
-    num_obs     = 41
-    num_actions = 10
+    num_obs            = 41
+    num_privileged_obs = 44   # actor obs + lin_vel(3) for critic
+    num_actions        = 10
 
     def __init__(self, num_envs=4096, sim_dt=0.005, control_decimation=4, device='cuda'):
         self.num_envs           = num_envs
@@ -76,7 +77,7 @@ class H1WalkingEnv:
             show_viewer=False,
             show_FPS=False,
         )
-        self.scene.add_entity(gs.morphs.Plane())
+        self.plane = self.scene.add_entity(gs.morphs.Plane())
         self.robot = self.scene.add_entity(
             gs.morphs.URDF(file=URDF_PATH, pos=(0., 0., 1.05))
         )
@@ -102,6 +103,7 @@ class H1WalkingEnv:
 
         # Link that terminates episode on contact (pelvis)
         self.pelvis_link_idx = self.robot.get_link('pelvis').idx_local
+        self.pelvis_local_idx = torch.tensor([self.pelvis_link_idx], device=self.device)
 
     # ------------------------------------------------------------------
     def reset(self, env_ids=None):
@@ -120,6 +122,14 @@ class H1WalkingEnv:
         )
         self.robot.zero_all_dofs_velocity(envs_idx=env_ids)
 
+        # Domain randomization: friction [0.1, 1.25] and base mass shift [-1, 3] kg
+        friction = torch.rand(n, device=self.device) * 1.15 + 0.1
+        self.plane.set_friction_ratio(friction, envs_idx=env_ids)
+        mass_shift = torch.rand(n, device=self.device) * 4.0 - 1.0
+        self.robot.set_mass_shift(
+            mass_shift.unsqueeze(1), self.pelvis_local_idx, envs_idx=env_ids
+        )
+
         self.episode_len_buf[env_ids]   = 0
         self.last_action[env_ids]       = 0
         self.last_dof_vel[env_ids]      = 0
@@ -129,7 +139,8 @@ class H1WalkingEnv:
         self.phase[env_ids]             = torch.rand(n, device=self.device)
         self._sample_commands(env_ids)
 
-        return self._get_obs()
+        obs = self._get_obs()
+        return obs, self._get_privileged_obs(obs)
 
     # ------------------------------------------------------------------
     def _sample_commands(self, env_ids):
@@ -156,11 +167,12 @@ class H1WalkingEnv:
         self.commands[no_vel, 2] = 0.
 
     def _push_robots(self):
-        """Apply random velocity impulse to all robots (domain randomization)."""
-        vel = self.robot.get_vel()
-        push = torch.zeros_like(vel)
-        push[:, :2] = (torch.rand(self.num_envs, 2, device=self.device) * 2 - 1) * MAX_PUSH_VEL
-        self.robot.set_vel(vel + push)
+        """Apply random velocity impulse via root joint DOFs (domain randomization)."""
+        root_lin_dofs = torch.arange(0, 3, device=self.device)
+        cur = self.robot.get_dofs_velocity(root_lin_dofs)
+        push = (torch.rand(self.num_envs, 3, device=self.device) * 2 - 1) * MAX_PUSH_VEL
+        push[:, 2] = 0.
+        self.robot.set_dofs_velocity(cur + push, root_lin_dofs)
 
     # ------------------------------------------------------------------
     def step(self, actions):
@@ -212,7 +224,8 @@ class H1WalkingEnv:
         if len(done_ids) > 0:
             self.reset(done_ids)
 
-        return self._get_obs(), rew, done
+        obs = self._get_obs()
+        return obs, self._get_privileged_obs(obs), rew, done
 
     # ------------------------------------------------------------------
     def _get_obs(self):
@@ -239,10 +252,14 @@ class H1WalkingEnv:
             cos_phase,
         ], dim=-1)
 
-        # Add observation noise (matches Unitree training config)
         obs += (2 * torch.rand_like(obs) - 1) * self.noise_vec
-
         return torch.clamp(obs, -5., 5.)
+
+    def _get_privileged_obs(self, obs):
+        """44-dim privileged obs for critic: lin_vel(3) prepended to obs(41)."""
+        quat    = self.robot.get_quat()
+        lin_vel = self._q_inv_rotate(quat, self.robot.get_vel()) * 2.0  # lin_vel_scale=2.0
+        return torch.cat([lin_vel, obs], dim=-1)
 
     def _q_inv_rotate(self, q, v):
         qw = q[:, 0]; qv = q[:, 1:]
@@ -277,10 +294,10 @@ class H1WalkingEnv:
         dof_pos   = self.robot.get_dofs_position(self.motor_dofs)
         r_hip_pos = -torch.sum(dof_pos[:, [0, 1, 2, 3]]**2, dim=1)
 
-        # ── DOF position soft limits ───────────────────────────────────────
+        # ── DOF position soft limits (linear violation, matches Unitree) ──────
         upper_viol = torch.clamp(dof_pos - self.dof_upper_soft, min=0.)
         lower_viol = torch.clamp(self.dof_lower_soft - dof_pos, min=0.)
-        r_dof_pos_limits = -torch.sum(upper_viol**2 + lower_viol**2, dim=1)
+        r_dof_pos_limits = -torch.sum(upper_viol + lower_viol, dim=1)
 
         # ── Hip/knee collision penalty ─────────────────────────────────────
         penalized_forces = torch.norm(

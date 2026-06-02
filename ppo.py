@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 from torch.distributions import Normal
@@ -40,18 +41,25 @@ def _mlp(in_dim, hidden_dims, out_dim, out_gain=1.0):
 
 
 class ActorCriticRecurrent(nn.Module):
-    """LSTM memory + small MLP actor/critic heads (matches Unitree H1 architecture)."""
+    """
+    Asymmetric actor-critic with LSTM memory (matches Unitree H1 architecture).
+    Actor:  obs(41)          → LSTM → MLP → action
+    Critic: LSTM features + privileged_extra(3) → MLP → value
+    At deployment only the actor is used.
+    """
 
-    def __init__(self, num_obs, num_actions, rnn_hidden=RNN_HIDDEN):
+    def __init__(self, num_obs, num_actions, num_privileged_obs=None, rnn_hidden=RNN_HIDDEN):
         super().__init__()
         self.rnn_hidden = rnn_hidden
+        # Extra dims given to critic but not actor (lin_vel = 3)
+        self.priv_dim = (num_privileged_obs - num_obs) if num_privileged_obs else 0
 
-        # Shared LSTM memory (batch_first=False: input shape (seq, batch, input))
-        self.memory = nn.LSTM(num_obs, rnn_hidden, num_layers=1, batch_first=False)
-        # tanh squashes actor output to (-1, 1), preventing mean from drifting to ±∞
-        self.actor  = nn.Sequential(_mlp(rnn_hidden, (32,), num_actions, out_gain=0.01), nn.Tanh())
-        self.critic = _mlp(rnn_hidden, (32,), 1, out_gain=1.0)
-        self.log_std = nn.Parameter(torch.zeros(num_actions))
+        self.memory  = nn.LSTM(num_obs, rnn_hidden, num_layers=1, batch_first=False)
+        # No Tanh on actor output — matches Unitree; clipping happens in env
+        self.actor   = _mlp(rnn_hidden, (32,), num_actions, out_gain=0.01)
+        self.critic  = _mlp(rnn_hidden + self.priv_dim, (32,), 1, out_gain=1.0)
+        # init_noise_std = 0.8 (matches Unitree H1RoughCfgPPO)
+        self.log_std = nn.Parameter(torch.full((num_actions,), math.log(0.8)))
 
         for name, p in self.memory.named_parameters():
             if 'weight' in name:
@@ -64,107 +72,110 @@ class ActorCriticRecurrent(nn.Module):
         return z, z.clone()
 
     def _std(self):
-        # Clamp log_std to [-3, 0] → std in [0.05, 1.0]
         return self.log_std.clamp(-3., 0.).exp()
 
+    def _critic_input(self, feat, priv_obs):
+        if self.priv_dim > 0 and priv_obs is not None:
+            extra = priv_obs[:, :self.priv_dim]
+            return torch.cat([feat, extra], dim=-1)
+        return feat
+
     @torch.no_grad()
-    def act(self, obs, hidden):
-        """Stochastic action — used during rollout collection."""
+    def act(self, obs, hidden, priv_obs=None):
         x, new_hid = self.memory(obs.unsqueeze(0), hidden)
-        x = x.squeeze(0)
+        x    = x.squeeze(0)
         mu   = self.actor(x)
         dist = Normal(mu, self._std())
         act  = dist.sample()
         lp   = dist.log_prob(act).sum(-1)
-        val  = self.critic(x).squeeze(-1)
+        val  = self.critic(self._critic_input(x, priv_obs)).squeeze(-1)
         return act, lp, val, new_hid
 
     @torch.no_grad()
     def act_deterministic(self, obs, hidden):
-        """Deterministic action (mean) — used for evaluation/play."""
+        """Deployment inference — no privileged obs needed."""
         x, new_hid = self.memory(obs.unsqueeze(0), hidden)
-        x = x.squeeze(0)
-        mu = self.actor(x)
-        return mu, new_hid
+        return self.actor(x.squeeze(0)), new_hid
 
     @torch.no_grad()
-    def get_value(self, obs, hidden):
+    def get_value(self, obs, hidden, priv_obs=None):
         x, _ = self.memory(obs.unsqueeze(0), hidden)
-        return self.critic(x.squeeze(0)).squeeze(-1)
+        return self.critic(self._critic_input(x.squeeze(0), priv_obs)).squeeze(-1)
 
-    def evaluate_sequence(self, obs_seq, done_seq, init_hidden, actions):
-        """Re-run LSTM over a full rollout sequence with done-masking.
-
-        obs_seq:     (T, N, obs_dim)
-        done_seq:    (T, N)   float, 1 = episode ended at this step
-        init_hidden: (h0, c0) each (1, N, rnn_hidden)
-        actions:     (T, N, act_dim)
-        returns: log_prob (T*N,), entropy (T*N,), value (T*N,)
-        """
+    def evaluate_sequence(self, obs_seq, done_seq, init_hidden, actions, priv_obs_seq=None):
+        """Re-run LSTM over rollout; critic uses privileged obs if provided."""
         T, N, _ = obs_seq.shape
         h, c = init_hidden
         features = []
         for t in range(T):
             x, (h, c) = self.memory(obs_seq[t].unsqueeze(0), (h, c))
-            features.append(x.squeeze(0))                          # (N, H)
-            # Zero hidden state for envs whose episode just ended
-            mask = (1.0 - done_seq[t]).unsqueeze(0).unsqueeze(-1)  # (1, N, 1)
+            features.append(x.squeeze(0))
+            mask = (1.0 - done_seq[t]).unsqueeze(0).unsqueeze(-1)
             h = h * mask
             c = c * mask
 
-        feat     = torch.stack(features).reshape(T * N, -1)        # (T*N, H)
+        feat     = torch.stack(features).reshape(T * N, -1)
         act_flat = actions.reshape(T * N, -1)
 
         dist = Normal(self.actor(feat), self._std())
         lp   = dist.log_prob(act_flat).sum(-1)
         ent  = dist.entropy().sum(-1)
-        val  = self.critic(feat).squeeze(-1)
+
+        if self.priv_dim > 0 and priv_obs_seq is not None:
+            extra = priv_obs_seq[:, :, :self.priv_dim].reshape(T * N, -1)
+            critic_in = torch.cat([feat, extra], dim=-1)
+        else:
+            critic_in = feat
+        val = self.critic(critic_in).squeeze(-1)
+
         return lp, ent, val
 
 
 class PPO:
-    def __init__(self, num_obs, num_actions, device='cuda',
-                 lr=1e-3, gamma=0.99, lam=0.95,
+    def __init__(self, num_obs, num_actions, num_privileged_obs=None,
+                 device='cuda', lr=1e-3, gamma=0.99, lam=0.95,
                  clip_eps=0.2, ent_coef=0.01, val_coef=1.0,
                  n_epochs=5, num_mini_batches=4,
                  rollout_steps=24, num_envs=4096):
 
-        self.device          = device
-        self.gamma           = gamma
-        self.lam             = lam
-        self.clip_eps        = clip_eps
-        self.ent_coef        = ent_coef
-        self.val_coef        = val_coef
-        self.n_epochs        = n_epochs
+        self.device           = device
+        self.gamma            = gamma
+        self.lam              = lam
+        self.clip_eps         = clip_eps
+        self.ent_coef         = ent_coef
+        self.val_coef         = val_coef
+        self.n_epochs         = n_epochs
         self.num_mini_batches = num_mini_batches
-        self.rollout_steps   = rollout_steps
-        self.num_envs        = num_envs
+        self.rollout_steps    = rollout_steps
+        self.num_envs         = num_envs
+        self.has_priv         = num_privileged_obs is not None
 
-        self.ac        = ActorCriticRecurrent(num_obs, num_actions).to(device)
+        self.ac        = ActorCriticRecurrent(num_obs, num_actions, num_privileged_obs).to(device)
         self.optimizer = torch.optim.Adam(self.ac.parameters(), lr=lr)
         self.rew_rms   = RunningMeanStd()
 
         T, N, H = rollout_steps, num_envs, RNN_HIDDEN
+        priv_dim = num_privileged_obs if num_privileged_obs else num_obs
         self.obs_buf  = torch.zeros(T, N, num_obs,     device=device)
+        self.priv_buf = torch.zeros(T, N, priv_dim,    device=device)
         self.act_buf  = torch.zeros(T, N, num_actions, device=device)
         self.rew_buf  = torch.zeros(T, N,              device=device)
         self.val_buf  = torch.zeros(T, N,              device=device)
         self.lp_buf   = torch.zeros(T, N,              device=device)
         self.done_buf = torch.zeros(T, N,              device=device)
 
-        # Hidden state at start of rollout (saved for BPTT during update)
         self.init_h = torch.zeros(1, N, H, device=device)
         self.init_c = torch.zeros(1, N, H, device=device)
         self.ptr    = 0
 
     def start_rollout(self, hidden):
-        """Call before each rollout to snapshot the initial hidden state."""
         self.init_h.copy_(hidden[0])
         self.init_c.copy_(hidden[1])
 
-    def store(self, obs, action, reward, value, log_prob, done):
+    def store(self, obs, priv_obs, action, reward, value, log_prob, done):
         self.rew_rms.update(reward)
         self.obs_buf [self.ptr] = obs
+        self.priv_buf[self.ptr] = priv_obs
         self.act_buf [self.ptr] = action
         self.rew_buf [self.ptr] = self.rew_rms.normalize(reward)
         self.val_buf [self.ptr] = value
@@ -172,12 +183,11 @@ class PPO:
         self.done_buf[self.ptr] = done.float()
         self.ptr += 1
 
-    def update(self, last_obs, last_hidden):
+    def update(self, last_obs, last_hidden, last_priv_obs=None):
         assert self.ptr == self.rollout_steps
 
-        last_val = self.ac.get_value(last_obs, last_hidden)
+        last_val = self.ac.get_value(last_obs, last_hidden, last_priv_obs)
 
-        # GAE-lambda returns
         adv = torch.zeros_like(self.rew_buf)
         gae = torch.zeros(self.num_envs, device=self.device)
         for t in reversed(range(self.rollout_steps)):
@@ -188,10 +198,9 @@ class PPO:
             adv[t] = gae
         ret = adv + self.val_buf
 
-        # Normalize advantages across the full rollout
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
-        T, N = self.rollout_steps, self.num_envs
+        T, N  = self.rollout_steps, self.num_envs
         mb_size = N // self.num_mini_batches
 
         stats = dict(policy_loss=0., value_loss=0., entropy=0., kl=0.)
@@ -202,19 +211,20 @@ class PPO:
             for start in range(0, N, mb_size):
                 ids = env_perm[start : start + mb_size]
 
-                obs_mb  = self.obs_buf [:, ids, :]
-                act_mb  = self.act_buf [:, ids, :]
-                done_mb = self.done_buf[:, ids]
-                lp_old  = self.lp_buf  [:, ids].reshape(-1)
-                val_old = self.val_buf [:, ids].reshape(-1)
-                ret_mb  = ret          [:, ids].reshape(-1)
-                adv_mb  = adv          [:, ids].reshape(-1)
-
-                init_h = self.init_h[:, ids, :]
-                init_c = self.init_c[:, ids, :]
+                obs_mb   = self.obs_buf [:, ids, :]
+                priv_mb  = self.priv_buf[:, ids, :]
+                act_mb   = self.act_buf [:, ids, :]
+                done_mb  = self.done_buf[:, ids]
+                lp_old   = self.lp_buf  [:, ids].reshape(-1)
+                val_old  = self.val_buf [:, ids].reshape(-1)
+                ret_mb   = ret          [:, ids].reshape(-1)
+                adv_mb   = adv          [:, ids].reshape(-1)
+                init_h   = self.init_h[:, ids, :]
+                init_c   = self.init_c[:, ids, :]
 
                 lp, ent, val = self.ac.evaluate_sequence(
-                    obs_mb, done_mb, (init_h, init_c), act_mb
+                    obs_mb, done_mb, (init_h, init_c), act_mb,
+                    priv_mb if self.has_priv else None,
                 )
 
                 ratio = (lp - lp_old).exp()
@@ -225,7 +235,7 @@ class PPO:
 
                 val_clipped = val_old + (val - val_old).clamp(-self.clip_eps, self.clip_eps)
                 vl = 0.5 * torch.max(
-                    (val     - ret_mb).pow(2),
+                    (val         - ret_mb).pow(2),
                     (val_clipped - ret_mb).pow(2),
                 ).mean()
 

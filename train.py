@@ -19,8 +19,8 @@ LR_INIT         = 1e-3
 DESIRED_KL      = 0.01   # adaptive LR target (matches rsl_rl)
 SAVE_INTERVAL   = 1000         # save checkpoint every N updates
 LOG_INTERVAL    = 10
-SAVE_DIR        = 'checkpoints_v3'
-TB_DIR          = 'runs_v3'
+SAVE_DIR        = 'checkpoints_v4'
+TB_DIR          = 'runs_v4'
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -46,13 +46,14 @@ def main():
 
     env = H1WalkingEnv(num_envs=NUM_ENVS, device='cuda')
     ppo = PPO(
-        num_obs       = env.num_obs,
-        num_actions   = env.num_actions,
-        device        = 'cuda',
-        lr            = LR_INIT,
-        rollout_steps = ROLLOUT_STEPS,
-        num_envs      = NUM_ENVS,
-        ent_coef      = 0.01,
+        num_obs            = env.num_obs,
+        num_actions        = env.num_actions,
+        num_privileged_obs = env.num_privileged_obs,
+        device             = 'cuda',
+        lr                 = LR_INIT,
+        rollout_steps      = ROLLOUT_STEPS,
+        num_envs           = NUM_ENVS,
+        ent_coef           = 0.01,
     )
 
     start_update  = 1
@@ -81,7 +82,7 @@ def main():
             print(f"Best reward so far: {best_mean_rew:.3f}")
 
     t0  = time.time() - total_steps / max(1, NUM_ENVS * 50)
-    obs = env.reset()
+    obs, priv_obs = env.reset()
 
     # Per-env LSTM hidden state, carried across rollouts
     hidden = ppo.ac.init_hidden(NUM_ENVS, 'cuda')
@@ -100,22 +101,22 @@ def main():
         ep_rew = 0.
         for _ in range(ROLLOUT_STEPS):
             with torch.no_grad():
-                action, log_prob, value, new_hidden = ppo.ac.act(obs, hidden)
+                action, log_prob, value, new_hidden = ppo.ac.act(obs, hidden, priv_obs)
 
-            next_obs, reward, done = env.step(action)
+            next_obs, next_priv_obs, reward, done = env.step(action)
 
-            # Zero hidden state for envs whose episode just ended
-            done_mask = done.float().unsqueeze(0).unsqueeze(-1)   # (1, N, 1)
+            done_mask = done.float().unsqueeze(0).unsqueeze(-1)
             new_hidden = (new_hidden[0] * (1 - done_mask),
                           new_hidden[1] * (1 - done_mask))
 
-            ppo.store(obs, action, reward, value, log_prob, done)
+            ppo.store(obs, priv_obs, action, reward, value, log_prob, done)
             hidden      = new_hidden
             obs         = next_obs
+            priv_obs    = next_priv_obs
             total_steps += NUM_ENVS
             ep_rew      += reward.mean().item()
 
-        metrics     = ppo.update(obs, hidden)
+        metrics     = ppo.update(obs, hidden, priv_obs)
         mean_ep_rew = ep_rew / ROLLOUT_STEPS
 
         # Adaptive LR: adjust based on KL divergence (matches rsl_rl)
