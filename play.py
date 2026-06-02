@@ -79,6 +79,9 @@ def main():
     device  = 'cpu' if args.cpu else 'cuda'
     backend = gs.cpu if args.cpu else gs.cuda
 
+    # ── Init genesis first (must precede any PyTorch CUDA ops) ───────────────
+    gs.init(backend=backend)
+
     # ── Load policy ──────────────────────────────────────────────────────────
     ac = ActorCriticRecurrent(NUM_OBS, NUM_ACTIONS).to(device)
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=True)
@@ -88,7 +91,6 @@ def main():
           f"(step {ckpt.get('total_steps', '?')})")
 
     # ── Build scene ──────────────────────────────────────────────────────────
-    gs.init(backend=backend)
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(dt=0.005, substeps=1),
         show_viewer=False,

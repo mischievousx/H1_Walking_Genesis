@@ -223,8 +223,8 @@ class H1WalkingEnv:
         # ── Velocity tracking ─────────────────────────────────────────────
         lin_err = torch.sum((self.commands[:, :2] - lin_vel[:, :2])**2, dim=1)
         ang_err = (self.commands[:, 2] - ang_vel[:, 2])**2
-        r_lin   = torch.exp(-lin_err / 0.25)
-        r_ang   = torch.exp(-ang_err / 0.25)
+        r_lin   = torch.exp(-lin_err / 0.1)
+        r_ang   = torch.exp(-ang_err / 0.1)
 
         # ── Body motion penalties ──────────────────────────────────────────
         r_lin_vel_z  = -lin_vel[:, 2]**2
@@ -266,8 +266,8 @@ class H1WalkingEnv:
         r_act_rate = -torch.sum((actions - self.last_action)**2, dim=1) * 0.01
 
         return (
-            1.0  * r_lin             +   # tracking lin vel
-            0.5  * r_ang             +   # tracking ang vel (heading-derived)
+            3.0  * r_lin             +   # tracking lin vel
+            1.5  * r_ang             +   # tracking ang vel (heading-derived)
             2.0  * r_lin_vel_z       +   # penalise vertical body vel
             0.05 * r_ang_vel_xy      +   # penalise roll/pitch angular vel
             1.0  * r_orientation     +   # penalise body tilt
