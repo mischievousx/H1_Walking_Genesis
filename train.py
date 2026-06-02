@@ -19,8 +19,8 @@ LR_INIT         = 1e-3
 DESIRED_KL      = 0.01   # adaptive LR target (matches rsl_rl)
 SAVE_INTERVAL   = 1000         # save checkpoint every N updates
 LOG_INTERVAL    = 10
-SAVE_DIR        = 'checkpoints_v2'
-TB_DIR          = 'runs_v2'
+SAVE_DIR        = 'checkpoints_v3'
+TB_DIR          = 'runs_v3'
 # ──────────────────────────────────────────────────────────────────────────────
 
 

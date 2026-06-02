@@ -14,11 +14,30 @@ _DEFAULT_DOF_POS = torch.tensor([
 _KP = torch.tensor([150,150,150,150,150,150,200,200,40,40], dtype=torch.float32)
 _KD = torch.tensor([  2,  2,  2,  2,  2,  2,  4,  4, 2, 2], dtype=torch.float32)
 
-RESAMPLE_INTERVAL = 500   # resample commands every 10 s (500 steps × 0.02 s)
+# DOF limits from URDF (Genesis order: L/R interleaved per joint type)
+_DOF_LOWER = torch.tensor([-0.43,-0.43, -0.43,-0.43, -1.57,-1.57, -0.26,-0.26, -0.87,-0.87])
+_DOF_UPPER = torch.tensor([ 0.43, 0.43,  0.43, 0.43,  1.57, 1.57,  2.05, 2.05,  0.52, 0.52])
+_SOFT_LIMIT = 0.9   # fraction of hard limit before penalty kicks in
+
+# Observation noise scales (uniform ±, applied after obs scaling)
+# noise_scale * noise_level * obs_scale  (noise_level=1.0)
+_NOISE_VEC = torch.tensor([
+    0.05, 0.05, 0.05,               # ang_vel   (0.2 * 0.25)
+    0.05, 0.05, 0.05,               # proj_g    (0.05)
+    0.00, 0.00, 0.00,               # commands  (no noise)
+    *([0.01] * 10),                 # dof_pos   (0.01 * 1.0)
+    *([0.075] * 10),                # dof_vel   (1.5 * 0.05)
+    *([0.00] * 10),                 # last_action
+    0.00, 0.00,                     # sin/cos phase
+])
+
+RESAMPLE_INTERVAL = 500   # resample commands every 10 s
+PUSH_INTERVAL     = 250   # push robots every 5 s (250 steps × 0.02 s)
+MAX_PUSH_VEL      = 1.5   # m/s
 
 
 class H1WalkingEnv:
-    num_obs     = 41   # ang_vel(3)+proj_g(3)+cmd(3)+dof_pos(10)+dof_vel(10)+action(10)+phase(2)
+    num_obs     = 41
     num_actions = 10
 
     def __init__(self, num_envs=4096, sim_dt=0.005, control_decimation=4, device='cuda'):
@@ -27,10 +46,14 @@ class H1WalkingEnv:
         self.sim_dt             = sim_dt
         self.control_decimation = control_decimation
         self.dt                 = sim_dt * control_decimation   # 0.02 s = 50 Hz
-        self.max_episode_length = 1000                          # 20 s
+        self.max_episode_length = 1000
 
         self.default_dof_pos = _DEFAULT_DOF_POS.to(device)
         self.motor_dofs      = torch.arange(6, 16, device=device)
+
+        self.dof_lower_soft  = (_DOF_LOWER * _SOFT_LIMIT).to(device)
+        self.dof_upper_soft  = (_DOF_UPPER * _SOFT_LIMIT).to(device)
+        self.noise_vec       = _NOISE_VEC.to(device)
 
         self.commands          = torch.zeros(num_envs, 3, device=device)
         self.heading_target    = torch.zeros(num_envs, device=device)
@@ -38,12 +61,10 @@ class H1WalkingEnv:
         self.last_action       = torch.zeros(num_envs, self.num_actions, device=device)
         self.last_dof_vel      = torch.zeros(num_envs, self.num_actions, device=device)
         self.last_dof_acc      = torch.zeros(num_envs, self.num_actions, device=device)
-
         self.foot_air_time     = torch.zeros(num_envs, 2, device=device)
         self.last_foot_contact = torch.ones(num_envs, 2, dtype=torch.bool, device=device)
-
-        # Gait phase [0, 1), period = 0.8 s, right leg leads by 0.5
-        self.phase = torch.zeros(num_envs, device=device)
+        self.phase             = torch.zeros(num_envs, device=device)
+        self.push_counter      = 0
 
         self._build_scene()
 
@@ -68,6 +89,19 @@ class H1WalkingEnv:
             self.robot.get_link('left_ankle_link').idx_local,
             self.robot.get_link('right_ankle_link').idx_local,
         ]
+
+        # Links penalized on contact (hip + knee)
+        _penalize_names = [
+            'left_hip_yaw_link', 'left_hip_roll_link', 'left_hip_pitch_link',
+            'right_hip_yaw_link', 'right_hip_roll_link', 'right_hip_pitch_link',
+            'left_knee_link', 'right_knee_link',
+        ]
+        self.penalized_link_idx = [
+            self.robot.get_link(n).idx_local for n in _penalize_names
+        ]
+
+        # Link that terminates episode on contact (pelvis)
+        self.pelvis_link_idx = self.robot.get_link('pelvis').idx_local
 
     # ------------------------------------------------------------------
     def reset(self, env_ids=None):
@@ -100,30 +134,33 @@ class H1WalkingEnv:
     # ------------------------------------------------------------------
     def _sample_commands(self, env_ids):
         n = len(env_ids)
-        vx = torch.rand(n, device=self.device) * 2.0 - 1.0   # -1.0 ~ 1.0 m/s
-        vy = torch.rand(n, device=self.device) * 1.0 - 0.5   # -0.5 ~ 0.5 m/s
+        vx = torch.rand(n, device=self.device) * 2.0 - 1.0   # [-1.0, 1.0] m/s
+        vy = torch.rand(n, device=self.device) * 2.0 - 1.0   # [-1.0, 1.0] m/s
         self.commands[env_ids, 0] = vx
         self.commands[env_ids, 1] = vy
-        # Sample target heading; yaw cmd is derived each step from heading error
         self.heading_target[env_ids] = (
             torch.rand(n, device=self.device) * 2 * 3.14159 - 3.14159
         )
-        # Zero small velocity commands (|vxy| < 0.2 m/s → stand still)
         small = torch.norm(self.commands[env_ids, :2], dim=1) < 0.2
         self.commands[env_ids[small], :2] = 0.
         self.heading_target[env_ids[small]] = 0.
 
     def _update_heading_command(self):
-        """Compute yaw-rate command from heading error each step."""
-        quat = self.robot.get_quat()   # (n, 4) [w,x,y,z]
+        quat = self.robot.get_quat()
         qw, qx, qy, qz = quat[:,0], quat[:,1], quat[:,2], quat[:,3]
         heading = torch.atan2(2*(qw*qz + qx*qy), 1 - 2*(qy**2 + qz**2))
         err = self.heading_target - heading
-        err = ((err + 3.14159) % (2 * 3.14159)) - 3.14159   # wrap to [-π, π]
+        err = ((err + 3.14159) % (2 * 3.14159)) - 3.14159
         self.commands[:, 2] = torch.clamp(0.5 * err, -1., 1.)
-        # Keep yaw cmd = 0 when velocity command is zero
         no_vel = torch.norm(self.commands[:, :2], dim=1) < 0.1
         self.commands[no_vel, 2] = 0.
+
+    def _push_robots(self):
+        """Apply random velocity impulse to all robots (domain randomization)."""
+        vel = self.robot.get_vel()
+        push = torch.zeros_like(vel)
+        push[:, :2] = (torch.rand(self.num_envs, 2, device=self.device) * 2 - 1) * MAX_PUSH_VEL
+        self.robot.set_vel(vel + push)
 
     # ------------------------------------------------------------------
     def step(self, actions):
@@ -139,15 +176,16 @@ class H1WalkingEnv:
         self.episode_len_buf += 1
         self.phase = (self.phase + self.dt / 0.8) % 1.0
 
-        # Periodically resample commands (every 10 s)
+        self.push_counter += 1
+        if self.push_counter % PUSH_INTERVAL == 0:
+            self._push_robots()
+
         resample_ids = (self.episode_len_buf % RESAMPLE_INTERVAL == 0).nonzero(as_tuple=False).flatten()
         if len(resample_ids) > 0:
             self._sample_commands(resample_ids)
 
-        # Update yaw command from heading error
         self._update_heading_command()
 
-        # ── Foot contact ──────────────────────────────────────────────────
         contact_forces = self.robot.get_links_net_contact_force()
         foot_contact = torch.stack([
             torch.norm(contact_forces[:, self.foot_link_idx[0], :], dim=-1) > 1.0,
@@ -160,10 +198,9 @@ class H1WalkingEnv:
         dof_acc     = (dof_vel_now - dof_vel_prev) / self.dt
         dof_jerk    = (dof_acc - self.last_dof_acc) / self.dt
 
-        rew  = self._compute_rewards(actions, dof_acc, dof_jerk, foot_contact)
-        # Clip total reward to ≥ 0 (avoids purely negative signal destabilising training)
+        rew  = self._compute_rewards(actions, dof_acc, dof_jerk, foot_contact, contact_forces)
         rew  = torch.clamp(rew, min=0.)
-        done = self._check_termination()
+        done = self._check_termination(contact_forces)
 
         self.foot_air_time[foot_contact] = 0.
         self.last_action       = actions.clone()
@@ -192,15 +229,19 @@ class H1WalkingEnv:
         cmd_scale = torch.tensor([2., 2., 0.25], device=self.device)
 
         obs = torch.cat([
-            ang_vel * 0.25,            # 3
-            proj_g,                    # 3
-            self.commands * cmd_scale, # 3
-            dof_pos,                   # 10
-            dof_vel * 0.05,            # 10
-            self.last_action,          # 10
-            sin_phase,                 # 1
-            cos_phase,                 # 1
-        ], dim=-1)                     # = 41
+            ang_vel * 0.25,
+            proj_g,
+            self.commands * cmd_scale,
+            dof_pos,
+            dof_vel * 0.05,
+            self.last_action,
+            sin_phase,
+            cos_phase,
+        ], dim=-1)
+
+        # Add observation noise (matches Unitree training config)
+        obs += (2 * torch.rand_like(obs) - 1) * self.noise_vec
+
         return torch.clamp(obs, -5., 5.)
 
     def _q_inv_rotate(self, q, v):
@@ -211,7 +252,7 @@ class H1WalkingEnv:
         return a - b + c
 
     # ------------------------------------------------------------------
-    def _compute_rewards(self, actions, dof_acc, dof_jerk, foot_contact):
+    def _compute_rewards(self, actions, dof_acc, dof_jerk, foot_contact, contact_forces):
         quat    = self.robot.get_quat()
         lin_vel = self._q_inv_rotate(quat, self.robot.get_vel())
         ang_vel = self._q_inv_rotate(quat, self.robot.get_ang())
@@ -220,11 +261,11 @@ class H1WalkingEnv:
             torch.tensor([[0., 0., -1.]], device=self.device).expand(self.num_envs, -1),
         )
 
-        # ── Velocity tracking ─────────────────────────────────────────────
+        # ── Velocity tracking (sigma=0.25, matches Unitree base config) ──────
         lin_err = torch.sum((self.commands[:, :2] - lin_vel[:, :2])**2, dim=1)
         ang_err = (self.commands[:, 2] - ang_vel[:, 2])**2
-        r_lin   = torch.exp(-lin_err / 0.1)
-        r_ang   = torch.exp(-ang_err / 0.1)
+        r_lin   = torch.exp(-lin_err / 0.25)
+        r_ang   = torch.exp(-ang_err / 0.25)
 
         # ── Body motion penalties ──────────────────────────────────────────
         r_lin_vel_z  = -lin_vel[:, 2]**2
@@ -235,6 +276,17 @@ class H1WalkingEnv:
         # ── Joint penalties ────────────────────────────────────────────────
         dof_pos   = self.robot.get_dofs_position(self.motor_dofs)
         r_hip_pos = -torch.sum(dof_pos[:, [0, 1, 2, 3]]**2, dim=1)
+
+        # ── DOF position soft limits ───────────────────────────────────────
+        upper_viol = torch.clamp(dof_pos - self.dof_upper_soft, min=0.)
+        lower_viol = torch.clamp(self.dof_lower_soft - dof_pos, min=0.)
+        r_dof_pos_limits = -torch.sum(upper_viol**2 + lower_viol**2, dim=1)
+
+        # ── Hip/knee collision penalty ─────────────────────────────────────
+        penalized_forces = torch.norm(
+            contact_forces[:, self.penalized_link_idx, :], dim=-1
+        )
+        r_collision = -torch.sum((penalized_forces > 0.1).float(), dim=1)
 
         # ── Gait phase contact timing ──────────────────────────────────────
         phase_left  = self.phase
@@ -262,35 +314,38 @@ class H1WalkingEnv:
 
         # ── Smoothness ────────────────────────────────────────────────────
         r_dof_acc  = -torch.sum(dof_acc**2,  dim=1) * 2.5e-7
-        r_jerk     = -torch.sum(dof_jerk**2, dim=1) * 2.5e-11
         r_act_rate = -torch.sum((actions - self.last_action)**2, dim=1) * 0.01
 
+        # Weights exactly matching Unitree H1RoughCfg
         return (
-            3.0  * r_lin             +   # tracking lin vel
-            1.5  * r_ang             +   # tracking ang vel (heading-derived)
-            2.0  * r_lin_vel_z       +   # penalise vertical body vel
-            0.05 * r_ang_vel_xy      +   # penalise roll/pitch angular vel
-            1.0  * r_orientation     +   # penalise body tilt
-            10.0 * r_height          +   # maintain height
-            1.0  * r_hip_pos         +   # keep hips centred
-            0.18 * r_contact         +   # gait phase contact timing
-            20.0 * r_swing_height    +   # foot swing height during swing
-            0.2  * r_contact_no_vel  +   # no foot sliding on contact
-            0.15 * r_alive           +   # alive bonus
-            1.0  * r_dof_acc         +   # acceleration smoothness
-            1.0  * r_jerk            +   # jerk smoothness, suppresses vibration
-            1.0  * r_act_rate            # smooth actions
+            1.0  * r_lin             +   # tracking_lin_vel
+            0.5  * r_ang             +   # tracking_ang_vel
+            2.0  * r_lin_vel_z       +   # lin_vel_z
+            0.05 * r_ang_vel_xy      +   # ang_vel_xy
+            1.0  * r_orientation     +   # orientation
+            10.0 * r_height          +   # base_height
+            1.0  * r_hip_pos         +   # hip_pos
+            5.0  * r_dof_pos_limits  +   # dof_pos_limits
+            1.0  * r_collision       +   # collision
+            0.18 * r_contact         +   # contact
+            20.0 * r_swing_height    +   # feet_swing_height
+            0.2  * r_contact_no_vel  +   # contact_no_vel
+            0.15 * r_alive           +   # alive
+            1.0  * r_dof_acc         +   # dof_acc
+            1.0  * r_act_rate            # action_rate
         )
 
     # ------------------------------------------------------------------
-    def _check_termination(self):
+    def _check_termination(self, contact_forces):
         quat  = self.robot.get_quat()
         pos   = self.robot.get_pos()
         proj_g = self._q_inv_rotate(
             quat,
             torch.tensor([[0., 0., -1.]], device=self.device).expand(self.num_envs, -1),
         )
-        height_fail = pos[:, 2] < 0.5
-        tilt_fail   = proj_g[:, 2] > -0.5
-        timeout     = self.episode_len_buf >= self.max_episode_length
-        return height_fail | tilt_fail | timeout
+        height_fail  = pos[:, 2] < 0.5
+        tilt_fail    = proj_g[:, 2] > -0.5
+        timeout      = self.episode_len_buf >= self.max_episode_length
+        # Terminate if pelvis touches ground
+        pelvis_contact = torch.norm(contact_forces[:, self.pelvis_link_idx, :], dim=-1) > 1.0
+        return height_fail | tilt_fail | timeout | pelvis_contact
