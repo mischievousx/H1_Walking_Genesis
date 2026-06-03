@@ -37,12 +37,12 @@ VX_RAMP_RATE = 0.02   # m/s per control step → 1.0 m/s/s at 50 Hz
 # Each phase: (steps, vx, vy, heading_target_rad, label)
 # 50 control-steps ≈ 1 second  (control dt = 0.02s)
 PHASES = [
-    (200, 1.0, 0.0,  0.0,          "Forward"),
-    (300, 0.0, 0.0,  math.pi / 2,  "Left turn"),
-    (200, 1.0, 0.0,  math.pi / 2,  "Forward"),
-    (300, 0.0, 0.0,  0.0,          "Right turn"),
-    (200, 1.0, 0.0,  0.0,          "Forward"),
-    (200, 0.0, 0.0,  0.0,          "Stop"),
+    (200, 0.5, 0.0,  0.0,         "Forward"),
+    (300, 0.4, 0.0,  math.pi/2,   "Left turn"),
+    (200, 0.5, 0.0,  math.pi/2,   "Forward"),
+    (300, 0.4, 0.0,  0.0,         "Right turn"),
+    (150, 0.5, 0.0,  0.0,         "Forward"),
+    (100, 0.0, 0.0,  0.0,         "Stop"),
 ]
 
 
@@ -54,7 +54,7 @@ def quat_rotate_inverse(q, v):
     return a - b + c
 
 
-def get_obs(robot, last_action, commands, phase, device):
+def get_obs(robot, last_action, commands, phase, device, obs_norm=None):
     quat    = robot.get_quat()
     ang_vel = quat_rotate_inverse(quat, robot.get_ang())
     proj_g  = quat_rotate_inverse(quat, torch.tensor([[0., 0., -1.]], device=device))
@@ -74,7 +74,10 @@ def get_obs(robot, last_action, commands, phase, device):
         sin_phase,
         cos_phase,
     ], dim=-1)
-    return torch.clamp(obs, -5., 5.)
+    obs = torch.clamp(obs, -5., 5.)
+    if obs_norm is not None:
+        obs = torch.clamp((obs - obs_norm['mean']) / torch.sqrt(obs_norm['var'] + 1e-4), -10., 10.)
+    return obs
 
 
 def _annotate(rgb: np.ndarray, label: str) -> np.ndarray:
@@ -98,7 +101,7 @@ def _annotate(rgb: np.ndarray, label: str) -> np.ndarray:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--checkpoint', default='checkpoints_v2/h1_walk_002000.pt')
+    parser.add_argument('--checkpoint', default='checkpoints_v5_003/h1_walk_best.pt')
     parser.add_argument('--out',        default='videos/demo_sequence.mp4')
     parser.add_argument('--cpu',        action='store_true')
     args = parser.parse_args()
@@ -111,11 +114,26 @@ def main():
     # Init genesis first (must precede any PyTorch CUDA ops)
     gs.init(backend=backend)
 
-    ac = ActorCriticRecurrent(NUM_OBS, NUM_ACTIONS).to(device)
+    ac = ActorCriticRecurrent(NUM_OBS, NUM_ACTIONS, num_privileged_obs=NUM_OBS+3).to(device)
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=True)
     ac.load_state_dict(ckpt['model'])
     ac.eval()
     print(f"Loaded: {args.checkpoint}  (step {ckpt.get('total_steps', '?')})")
+
+    # Load obs normalizer if present (v5 checkpoints)
+    obs_norm = None
+    ckpt_dir = os.path.dirname(args.checkpoint) or '.'
+    for norm_candidate in [
+        os.path.join(ckpt_dir, 'obs_norm_best.pt'),
+        os.path.join(ckpt_dir, 'obs_norm.pt'),
+    ]:
+        if os.path.exists(norm_candidate):
+            nd = torch.load(norm_candidate, map_location=device, weights_only=True)
+            if 'obs' in nd:
+                obs_norm = {'mean': nd['obs']['mean'].to(device),
+                            'var':  nd['obs']['var'].to(device)}
+                print(f"Loaded obs normalizer: {norm_candidate}")
+            break
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(dt=0.005, substeps=1),
         show_viewer=False,
@@ -176,7 +194,7 @@ def main():
                 yaw_cmd = yaw_cmd * 0.
             commands[0, 2] = yaw_cmd
 
-            obs = get_obs(robot, last_action, commands, phase, device)
+            obs = get_obs(robot, last_action, commands, phase, device, obs_norm)
             phase = (phase + 0.02 / 0.8) % 1.0
 
             with torch.no_grad():

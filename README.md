@@ -36,6 +36,8 @@ pip install tensorboard imageio
 
 ## Training
 
+Basic training with default parameters:
+
 ```bash
 python -u train.py
 ```
@@ -45,6 +47,42 @@ Logs are printed every 10 updates. TensorBoard:
 ```bash
 tensorboard --logdir runs
 ```
+
+### Experiment: dof_acc ablation
+
+Three parallel runs comparing joint acceleration penalty strength. All other parameters identical.
+
+**Baseline (`dof_acc = -1e-6`)**
+```bash
+python -u train.py --save-dir checkpoints_v4_r48s --rollout 48 \
+    --ang-vel-xy -0.2 --feet-swing-height -40.0 --tracking-lin-vel 2.0 \
+    --dof-acc -1e-6 --contact-no-vel -0.5 --action-rate -0.03
+```
+
+**5x (`dof_acc = -5e-6`)**
+```bash
+python -u train.py --save-dir checkpoints_v4_r48s_acc5x --rollout 48 \
+    --ang-vel-xy -0.2 --feet-swing-height -40.0 --tracking-lin-vel 2.0 \
+    --dof-acc -5e-6 --contact-no-vel -0.5 --action-rate -0.03
+```
+
+**10x (`dof_acc = -1e-5`)**
+```bash
+python -u train.py --save-dir checkpoints_v4_r48s_acc10x --rollout 48 \
+    --ang-vel-xy -0.2 --feet-swing-height -40.0 --tracking-lin-vel 2.0 \
+    --dof-acc -1e-5 --contact-no-vel -0.5 --action-rate -0.03
+```
+
+Key reward scale changes vs. defaults:
+
+| Parameter | Default | This experiment |
+|-----------|---------|-----------------|
+| `tracking_lin_vel` | 1.0 | 2.0 |
+| `ang_vel_xy` | -0.05 | -0.2 |
+| `feet_swing_height` | -20.0 | -40.0 |
+| `contact_no_vel` | -0.2 | -0.5 |
+| `action_rate` | -0.01 | -0.03 |
+| `dof_acc` | -2.5e-7 | -1e-6 / -5e-6 / -1e-5 |
 
 ## Visualization
 

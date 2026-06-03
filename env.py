@@ -4,41 +4,64 @@ import genesis as gs
 
 URDF_PATH = os.path.join(os.path.dirname(__file__), 'robot/urdf/h1.urdf')
 
+# DOF order in Genesis: interleaved L/R per joint type
+# [L_hip_yaw, R_hip_yaw, L_hip_roll, R_hip_roll, L_hip_pitch, R_hip_pitch,
+#  L_knee, R_knee, L_ankle, R_ankle]
 _DEFAULT_DOF_POS = torch.tensor([
-    0.,  0.,    # hip yaw  L, R
-    0.,  0.,    # hip roll L, R
+    0.,  0.,    # hip yaw   L, R
+    0.,  0.,    # hip roll  L, R
    -0.1,-0.1,  # hip pitch L, R
-    0.3, 0.3,  # knee L, R
-   -0.2,-0.2,  # ankle L, R
+    0.3, 0.3,  # knee      L, R
+   -0.2,-0.2,  # ankle     L, R
 ])
-_KP = torch.tensor([150,150,150,150,150,150,200,200,40,40], dtype=torch.float32)
-_KD = torch.tensor([  2,  2,  2,  2,  2,  2,  4,  4, 2, 2], dtype=torch.float32)
 
-# DOF limits from URDF (Genesis order: L/R interleaved per joint type)
+# PD gains matching H1RoughCfg (Genesis order)
+_KP = torch.tensor([150., 150., 150., 150., 150., 150., 200., 200.,  40.,  40.])
+_KD = torch.tensor([  2.,   2.,   2.,   2.,   2.,   2.,   4.,   4.,   2.,   2.])
+
+# DOF soft limits (90% of URDF hard limits, Genesis DOF order)
 _DOF_LOWER = torch.tensor([-0.43,-0.43, -0.43,-0.43, -1.57,-1.57, -0.26,-0.26, -0.87,-0.87])
 _DOF_UPPER = torch.tensor([ 0.43, 0.43,  0.43, 0.43,  1.57, 1.57,  2.05, 2.05,  0.52, 0.52])
-_SOFT_LIMIT = 0.9   # fraction of hard limit before penalty kicks in
+_SOFT_LIMIT = 0.9
 
-# Observation noise scales (uniform ±, applied after obs scaling)
-# noise_scale * noise_level * obs_scale  (noise_level=1.0)
+# Observation noise: noise_scale * noise_level(1.0) * obs_scale
 _NOISE_VEC = torch.tensor([
-    0.05, 0.05, 0.05,               # ang_vel   (0.2 * 0.25)
-    0.05, 0.05, 0.05,               # proj_g    (0.05)
-    0.00, 0.00, 0.00,               # commands  (no noise)
-    *([0.01] * 10),                 # dof_pos   (0.01 * 1.0)
-    *([0.075] * 10),                # dof_vel   (1.5 * 0.05)
-    *([0.00] * 10),                 # last_action
-    0.00, 0.00,                     # sin/cos phase
+    0.05, 0.05, 0.05,    # ang_vel   (0.2 * 0.25)
+    0.05, 0.05, 0.05,    # proj_g    (0.05 * 1.0)
+    0.00, 0.00, 0.00,    # commands  (no noise)
+    *([0.01] * 10),      # dof_pos   (0.01 * 1.0)
+    *([0.075] * 10),     # dof_vel   (1.5 * 0.05)
+    *([0.00] * 10),      # last_action
+    0.00, 0.00,          # sin/cos phase
 ])
 
-RESAMPLE_INTERVAL = 500   # resample commands every 10 s
-PUSH_INTERVAL     = 250   # push robots every 5 s (250 steps × 0.02 s)
+# H1RoughCfg reward scales — will be multiplied by dt in __init__
+_REWARD_SCALES = {
+    'tracking_lin_vel':  1.0,
+    'tracking_ang_vel':  0.5,
+    'lin_vel_z':        -2.0,
+    'ang_vel_xy':       -0.05,
+    'orientation':      -1.0,
+    'base_height':     -10.0,
+    'dof_acc':         -2.5e-7,
+    'collision':        -1.0,
+    'action_rate':      -0.01,
+    'dof_pos_limits':   -5.0,
+    'alive':             0.15,
+    'hip_pos':          -1.0,
+    'contact_no_vel':   -0.2,
+    'feet_swing_height':-20.0,
+    'contact':           0.18,
+}
+
+RESAMPLE_INTERVAL = 500   # steps between command resamples (~10 s)
+PUSH_INTERVAL     = 250   # steps between random pushes (~5 s)
 MAX_PUSH_VEL      = 1.5   # m/s
 
 
 class H1WalkingEnv:
-    num_obs            = 41
-    num_privileged_obs = 44   # actor obs + lin_vel(3) for critic
+    num_obs            = 41   # ang_vel(3)+proj_g(3)+cmd(3)+dof_pos(10)+dof_vel(10)+action(10)+phase(2)
+    num_privileged_obs = 44   # lin_vel(3) prepended for critic
     num_actions        = 10
 
     def __init__(self, num_envs=4096, sim_dt=0.005, control_decimation=4, device='cuda'):
@@ -46,26 +69,27 @@ class H1WalkingEnv:
         self.device             = device
         self.sim_dt             = sim_dt
         self.control_decimation = control_decimation
-        self.dt                 = sim_dt * control_decimation   # 0.02 s = 50 Hz
-        self.max_episode_length = 1000
+        self.dt                 = sim_dt * control_decimation   # 0.02 s
+
+        self.max_episode_length = 1000  # 20 s at 50 Hz
 
         self.default_dof_pos = _DEFAULT_DOF_POS.to(device)
         self.motor_dofs      = torch.arange(6, 16, device=device)
 
-        self.dof_lower_soft  = (_DOF_LOWER * _SOFT_LIMIT).to(device)
-        self.dof_upper_soft  = (_DOF_UPPER * _SOFT_LIMIT).to(device)
-        self.noise_vec       = _NOISE_VEC.to(device)
+        self.dof_lower_soft = (_DOF_LOWER * _SOFT_LIMIT).to(device)
+        self.dof_upper_soft = (_DOF_UPPER * _SOFT_LIMIT).to(device)
+        self.noise_vec      = _NOISE_VEC.to(device)
 
-        self.commands          = torch.zeros(num_envs, 3, device=device)
-        self.heading_target    = torch.zeros(num_envs, device=device)
-        self.episode_len_buf   = torch.zeros(num_envs, dtype=torch.int32, device=device)
-        self.last_action       = torch.zeros(num_envs, self.num_actions, device=device)
-        self.last_dof_vel      = torch.zeros(num_envs, self.num_actions, device=device)
-        self.last_dof_acc      = torch.zeros(num_envs, self.num_actions, device=device)
-        self.foot_air_time     = torch.zeros(num_envs, 2, device=device)
-        self.last_foot_contact = torch.ones(num_envs, 2, dtype=torch.bool, device=device)
-        self.phase             = torch.zeros(num_envs, device=device)
-        self.push_counter      = 0
+        # Reward scales × dt (matches Unitree _prepare_reward_function)
+        self.scales = {k: v * self.dt for k, v in _REWARD_SCALES.items()}
+
+        self.commands       = torch.zeros(num_envs, 3, device=device)
+        self.heading_target = torch.zeros(num_envs, device=device)
+        self.episode_len_buf = torch.zeros(num_envs, dtype=torch.int32, device=device)
+        self.last_action    = torch.zeros(num_envs, self.num_actions, device=device)
+        self.last_dof_vel   = torch.zeros(num_envs, self.num_actions, device=device)
+        self.phase          = torch.zeros(num_envs, device=device)
+        self.push_counter   = 0
 
         self._build_scene()
 
@@ -86,22 +110,20 @@ class H1WalkingEnv:
         self.robot.set_dofs_kp(_KP.to(self.device), self.motor_dofs)
         self.robot.set_dofs_kv(_KD.to(self.device), self.motor_dofs)
 
+        # Foot links (ankle joints = feet in contact detection)
         self.foot_link_idx = [
             self.robot.get_link('left_ankle_link').idx_local,
             self.robot.get_link('right_ankle_link').idx_local,
         ]
 
-        # Links penalized on contact (hip + knee)
-        _penalize_names = [
-            'left_hip_yaw_link', 'left_hip_roll_link', 'left_hip_pitch_link',
-            'right_hip_yaw_link', 'right_hip_roll_link', 'right_hip_pitch_link',
-            'left_knee_link', 'right_knee_link',
-        ]
+        # Links penalized for unwanted contact
         self.penalized_link_idx = [
-            self.robot.get_link(n).idx_local for n in _penalize_names
+            self.robot.get_link(n).idx_local for n in [
+                'left_hip_yaw_link', 'left_hip_roll_link', 'left_hip_pitch_link',
+                'right_hip_yaw_link', 'right_hip_roll_link', 'right_hip_pitch_link',
+                'left_knee_link', 'right_knee_link',
+            ]
         ]
-
-        # Link that terminates episode on contact (pelvis)
         self.pelvis_link_idx = self.robot.get_link('pelvis').idx_local
         self.pelvis_local_idx = torch.tensor([self.pelvis_link_idx], device=self.device)
 
@@ -116,13 +138,20 @@ class H1WalkingEnv:
 
         self.robot.set_pos(pos, envs_idx=env_ids)
         self.robot.set_quat(quat, envs_idx=env_ids)
+        # DOF position randomization: 0.5 ~ 1.5 × default (matches Unitree _reset_dofs)
+        dof_rand = torch.rand(n, len(self.motor_dofs), device=self.device) * 1.0 + 0.5
         self.robot.set_dofs_position(
-            self.default_dof_pos.unsqueeze(0).expand(n, -1),
+            self.default_dof_pos.unsqueeze(0) * dof_rand,
             self.motor_dofs, envs_idx=env_ids,
         )
         self.robot.zero_all_dofs_velocity(envs_idx=env_ids)
 
-        # Domain randomization: friction [0.1, 1.25] and base mass shift [-1, 3] kg
+        # Root velocity randomization: ±0.5 m/s and rad/s (matches Unitree _reset_root_states)
+        root_vel = (torch.rand(n, 6, device=self.device) * 2 - 1) * 0.5
+        base_dofs = torch.arange(0, 6, device=self.device)
+        self.robot.set_dofs_velocity(root_vel, base_dofs, envs_idx=env_ids)
+
+        # Domain randomization: friction [0.1, 1.25], base mass [-1, 3] kg
         friction = torch.rand(n, device=self.device) * 1.15 + 0.1
         self.plane.set_friction_ratio(friction, envs_idx=env_ids)
         mass_shift = torch.rand(n, device=self.device) * 4.0 - 1.0
@@ -130,13 +159,10 @@ class H1WalkingEnv:
             mass_shift.unsqueeze(1), self.pelvis_local_idx, envs_idx=env_ids
         )
 
-        self.episode_len_buf[env_ids]   = 0
-        self.last_action[env_ids]       = 0
-        self.last_dof_vel[env_ids]      = 0
-        self.last_dof_acc[env_ids]      = 0
-        self.foot_air_time[env_ids]     = 0
-        self.last_foot_contact[env_ids] = True
-        self.phase[env_ids]             = torch.rand(n, device=self.device)
+        self.episode_len_buf[env_ids] = 0
+        self.last_action[env_ids]     = 0
+        self.last_dof_vel[env_ids]    = 0
+        self.phase[env_ids]           = torch.rand(n, device=self.device)
         self._sample_commands(env_ids)
 
         obs = self._get_obs()
@@ -152,6 +178,7 @@ class H1WalkingEnv:
         self.heading_target[env_ids] = (
             torch.rand(n, device=self.device) * 2 * 3.14159 - 3.14159
         )
+        # Zero out small commands (norm < 0.2), matching Unitree _resample_commands
         small = torch.norm(self.commands[env_ids, :2], dim=1) < 0.2
         self.commands[env_ids[small], :2] = 0.
         self.heading_target[env_ids[small]] = 0.
@@ -167,9 +194,8 @@ class H1WalkingEnv:
         self.commands[no_vel, 2] = 0.
 
     def _push_robots(self):
-        """Apply random velocity impulse via root joint DOFs (domain randomization)."""
         root_lin_dofs = torch.arange(0, 3, device=self.device)
-        cur = self.robot.get_dofs_velocity(root_lin_dofs)
+        cur  = self.robot.get_dofs_velocity(root_lin_dofs)
         push = (torch.rand(self.num_envs, 3, device=self.device) * 2 - 1) * MAX_PUSH_VEL
         push[:, 2] = 0.
         self.robot.set_dofs_velocity(cur + push, root_lin_dofs)
@@ -177,7 +203,7 @@ class H1WalkingEnv:
     # ------------------------------------------------------------------
     def step(self, actions):
         actions = torch.clamp(actions, -1., 1.)
-        target  = self.default_dof_pos + actions * 0.25
+        target  = self.default_dof_pos + actions * 0.25   # action_scale = 0.25
 
         dof_vel_prev = self.robot.get_dofs_velocity(self.motor_dofs).clone()
 
@@ -186,7 +212,7 @@ class H1WalkingEnv:
             self.scene.step()
 
         self.episode_len_buf += 1
-        self.phase = (self.phase + self.dt / 0.8) % 1.0
+        self.phase = (self.phase + self.dt / 0.8) % 1.0   # period = 0.8 s
 
         self.push_counter += 1
         if self.push_counter % PUSH_INTERVAL == 0:
@@ -195,30 +221,19 @@ class H1WalkingEnv:
         resample_ids = (self.episode_len_buf % RESAMPLE_INTERVAL == 0).nonzero(as_tuple=False).flatten()
         if len(resample_ids) > 0:
             self._sample_commands(resample_ids)
-
         self._update_heading_command()
 
         contact_forces = self.robot.get_links_net_contact_force()
-        foot_contact = torch.stack([
-            torch.norm(contact_forces[:, self.foot_link_idx[0], :], dim=-1) > 1.0,
-            torch.norm(contact_forces[:, self.foot_link_idx[1], :], dim=-1) > 1.0,
-        ], dim=1)
+        dof_vel_now    = self.robot.get_dofs_velocity(self.motor_dofs)
+        dof_acc        = (dof_vel_now - dof_vel_prev) / self.dt
 
-        self.foot_air_time += self.dt
-
-        dof_vel_now = self.robot.get_dofs_velocity(self.motor_dofs)
-        dof_acc     = (dof_vel_now - dof_vel_prev) / self.dt
-        dof_jerk    = (dof_acc - self.last_dof_acc) / self.dt
-
-        rew  = self._compute_rewards(actions, dof_acc, dof_jerk, foot_contact, contact_forces)
+        rew  = self._compute_rewards(actions, dof_acc, contact_forces)
+        # only_positive_rewards = True (H1RoughCfg)
         rew  = torch.clamp(rew, min=0.)
         done = self._check_termination(contact_forces)
 
-        self.foot_air_time[foot_contact] = 0.
-        self.last_action       = actions.clone()
-        self.last_dof_vel      = dof_vel_now.clone()
-        self.last_foot_contact = foot_contact.clone()
-        self.last_dof_acc      = dof_acc.clone()
+        self.last_action  = actions.clone()
+        self.last_dof_vel = dof_vel_now.clone()
 
         done_ids = done.nonzero(as_tuple=False).flatten()
         if len(done_ids) > 0:
@@ -232,21 +247,20 @@ class H1WalkingEnv:
         quat    = self.robot.get_quat()
         ang_vel = self._q_inv_rotate(quat, self.robot.get_ang())
         proj_g  = self._q_inv_rotate(
-            quat,
-            torch.tensor([[0., 0., -1.]], device=self.device).expand(self.num_envs, -1),
+            quat, torch.tensor([[0.,0.,-1.]], device=self.device).expand(self.num_envs,-1)
         )
         dof_pos   = self.robot.get_dofs_position(self.motor_dofs) - self.default_dof_pos
         dof_vel   = self.robot.get_dofs_velocity(self.motor_dofs)
         sin_phase = torch.sin(2 * torch.pi * self.phase).unsqueeze(1)
         cos_phase = torch.cos(2 * torch.pi * self.phase).unsqueeze(1)
-        cmd_scale = torch.tensor([2., 2., 0.25], device=self.device)
+        cmd_scale = torch.tensor([2., 2., 0.25], device=self.device)  # [lin_vel, lin_vel, ang_vel]
 
         obs = torch.cat([
-            ang_vel * 0.25,
-            proj_g,
+            ang_vel * 0.25,       # ang_vel × obs_scale(0.25)
+            proj_g,               # projected gravity
             self.commands * cmd_scale,
-            dof_pos,
-            dof_vel * 0.05,
+            dof_pos * 1.0,        # dof_pos × obs_scale(1.0)
+            dof_vel * 0.05,       # dof_vel × obs_scale(0.05)
             self.last_action,
             sin_phase,
             cos_phase,
@@ -256,9 +270,8 @@ class H1WalkingEnv:
         return torch.clamp(obs, -5., 5.)
 
     def _get_privileged_obs(self, obs):
-        """44-dim privileged obs for critic: lin_vel(3) prepended to obs(41)."""
         quat    = self.robot.get_quat()
-        lin_vel = self._q_inv_rotate(quat, self.robot.get_vel()) * 2.0  # lin_vel_scale=2.0
+        lin_vel = self._q_inv_rotate(quat, self.robot.get_vel()) * 2.0  # lin_vel_scale = 2.0
         return torch.cat([lin_vel, obs], dim=-1)
 
     def _q_inv_rotate(self, q, v):
@@ -269,100 +282,101 @@ class H1WalkingEnv:
         return a - b + c
 
     # ------------------------------------------------------------------
-    def _compute_rewards(self, actions, dof_acc, dof_jerk, foot_contact, contact_forces):
+    def _compute_rewards(self, actions, dof_acc, contact_forces):
+        s = self.scales
         quat    = self.robot.get_quat()
         lin_vel = self._q_inv_rotate(quat, self.robot.get_vel())
         ang_vel = self._q_inv_rotate(quat, self.robot.get_ang())
         proj_g  = self._q_inv_rotate(
-            quat,
-            torch.tensor([[0., 0., -1.]], device=self.device).expand(self.num_envs, -1),
+            quat, torch.tensor([[0.,0.,-1.]], device=self.device).expand(self.num_envs,-1)
         )
 
-        # ── Velocity tracking (sigma=0.25, matches Unitree base config) ──────
-        lin_err = torch.sum((self.commands[:, :2] - lin_vel[:, :2])**2, dim=1)
-        ang_err = (self.commands[:, 2] - ang_vel[:, 2])**2
-        r_lin   = torch.exp(-lin_err / 0.25)
-        r_ang   = torch.exp(-ang_err / 0.25)
+        # ── Velocity tracking (sigma=0.25) ────────────────────────────────
+        lin_err = torch.sum((self.commands[:,:2] - lin_vel[:,:2])**2, dim=1)
+        ang_err = (self.commands[:,2] - ang_vel[:,2])**2
+        r_tracking_lin = torch.exp(-lin_err / 0.25)
+        r_tracking_ang = torch.exp(-ang_err / 0.25)
 
-        # ── Body motion penalties ──────────────────────────────────────────
-        r_lin_vel_z  = -lin_vel[:, 2]**2
-        r_ang_vel_xy = -torch.sum(ang_vel[:, :2]**2, dim=1)
-        r_orientation = -torch.sum(proj_g[:, :2]**2, dim=1)
-        r_height      = -(self.robot.get_pos()[:, 2] - 1.05)**2
+        # ── Body motion penalties (raw = positive error magnitude, scale is negative) ──
+        r_lin_vel_z   = lin_vel[:,2]**2
+        r_ang_vel_xy  = torch.sum(ang_vel[:,:2]**2, dim=1)
+        r_orientation = torch.sum(proj_g[:,:2]**2, dim=1)
+        r_base_height = (self.robot.get_pos()[:,2] - 1.05)**2
 
         # ── Joint penalties ────────────────────────────────────────────────
-        dof_pos   = self.robot.get_dofs_position(self.motor_dofs)
-        r_hip_pos = -torch.sum(dof_pos[:, [0, 1, 2, 3]]**2, dim=1)
+        dof_pos = self.robot.get_dofs_position(self.motor_dofs)
+        # Genesis order [0,1,2,3] = [L_yaw, R_yaw, L_roll, R_roll] = same set as Unitree [0,1,5,6]
+        r_hip_pos = torch.sum(dof_pos[:,[0,1,2,3]]**2, dim=1)
 
-        # ── DOF position soft limits (linear violation, matches Unitree) ──────
         upper_viol = torch.clamp(dof_pos - self.dof_upper_soft, min=0.)
         lower_viol = torch.clamp(self.dof_lower_soft - dof_pos, min=0.)
-        r_dof_pos_limits = -torch.sum(upper_viol + lower_viol, dim=1)
+        r_dof_pos_limits = torch.sum(upper_viol + lower_viol, dim=1)
 
-        # ── Hip/knee collision penalty ─────────────────────────────────────
-        penalized_forces = torch.norm(
-            contact_forces[:, self.penalized_link_idx, :], dim=-1
-        )
-        r_collision = -torch.sum((penalized_forces > 0.1).float(), dim=1)
+        # ── Collision penalty (hip + knee contact) ─────────────────────────
+        penalized = torch.norm(contact_forces[:, self.penalized_link_idx, :], dim=-1)
+        r_collision = torch.sum((penalized > 0.1).float(), dim=1)
 
-        # ── Gait phase contact timing ──────────────────────────────────────
-        phase_left  = self.phase
-        phase_right = (self.phase + 0.5) % 1.0
-        is_stance   = torch.stack([phase_left < 0.55, phase_right < 0.55], dim=1)
-        r_contact   = torch.sum((foot_contact == is_stance).float(), dim=1)
+        # ── Gait contact timing ────────────────────────────────────────────
+        # Unitree uses Z-force only for r_contact (matching _reward_contact)
+        phase_l   = self.phase
+        phase_r   = (self.phase + 0.5) % 1.0
+        is_stance = torch.stack([phase_l < 0.55, phase_r < 0.55], dim=1)
+        foot_contact_z = torch.stack([
+            contact_forces[:, self.foot_link_idx[0], 2] > 1.,
+            contact_forces[:, self.foot_link_idx[1], 2] > 1.,
+        ], dim=1)
+        r_contact = torch.sum((foot_contact_z == is_stance).float(), dim=1)
 
-        # ── Feet swing height ──────────────────────────────────────────────
+        # Swing height and contact_no_vel use 3D norm (matching _reward_feet_swing_height)
+        foot_contact_3d = torch.norm(
+            contact_forces[:, [self.foot_link_idx[0], self.foot_link_idx[1]], :], dim=-1
+        ) > 1.
         foot_pos = self.robot.get_links_pos()
         fl_z = foot_pos[:, self.foot_link_idx[0], 2]
         fr_z = foot_pos[:, self.foot_link_idx[1], 2]
-        swing = ~foot_contact
-        r_swing_height = -(swing[:, 0].float() * (fl_z - 0.08)**2 +
-                           swing[:, 1].float() * (fr_z - 0.08)**2)
+        swing = ~foot_contact_3d
+        r_feet_swing_height = (swing[:,0].float() * (fl_z - 0.08)**2 +
+                                swing[:,1].float() * (fr_z - 0.08)**2)
 
-        # ── Contact no velocity ────────────────────────────────────────────
         foot_vel = self.robot.get_links_vel()
-        fl_vel   = foot_vel[:, self.foot_link_idx[0], :]
-        fr_vel   = foot_vel[:, self.foot_link_idx[1], :]
-        r_contact_no_vel = -(foot_contact[:, 0].float() * torch.sum(fl_vel**2, dim=1) +
-                              foot_contact[:, 1].float() * torch.sum(fr_vel**2, dim=1))
+        fl_vel = foot_vel[:, self.foot_link_idx[0], :]
+        fr_vel = foot_vel[:, self.foot_link_idx[1], :]
+        r_contact_no_vel = (foot_contact_3d[:,0].float() * torch.sum(fl_vel**2, dim=1) +
+                             foot_contact_3d[:,1].float() * torch.sum(fr_vel**2, dim=1))
 
-        # ── Alive ─────────────────────────────────────────────────────────
+        # ── Alive ──────────────────────────────────────────────────────────
         r_alive = torch.ones(self.num_envs, device=self.device)
 
-        # ── Smoothness ────────────────────────────────────────────────────
-        r_dof_acc  = -torch.sum(dof_acc**2,  dim=1) * 2.5e-7
-        r_act_rate = -torch.sum((actions - self.last_action)**2, dim=1) * 0.01
+        # ── Smoothness ─────────────────────────────────────────────────────
+        r_dof_acc  = torch.sum(dof_acc**2, dim=1)
+        r_act_rate = torch.sum((actions - self.last_action)**2, dim=1)
 
-        # Weights exactly matching Unitree H1RoughCfg
         return (
-            1.0  * r_lin             +   # tracking_lin_vel
-            0.5  * r_ang             +   # tracking_ang_vel
-            2.0  * r_lin_vel_z       +   # lin_vel_z
-            0.05 * r_ang_vel_xy      +   # ang_vel_xy
-            1.0  * r_orientation     +   # orientation
-            10.0 * r_height          +   # base_height
-            1.0  * r_hip_pos         +   # hip_pos
-            5.0  * r_dof_pos_limits  +   # dof_pos_limits
-            1.0  * r_collision       +   # collision
-            0.18 * r_contact         +   # contact
-            20.0 * r_swing_height    +   # feet_swing_height
-            0.2  * r_contact_no_vel  +   # contact_no_vel
-            0.15 * r_alive           +   # alive
-            1.0  * r_dof_acc         +   # dof_acc
-            1.0  * r_act_rate            # action_rate
+            s['tracking_lin_vel']  * r_tracking_lin  +
+            s['tracking_ang_vel']  * r_tracking_ang  +
+            s['lin_vel_z']         * r_lin_vel_z      +
+            s['ang_vel_xy']        * r_ang_vel_xy     +
+            s['orientation']       * r_orientation    +
+            s['base_height']       * r_base_height    +
+            s['hip_pos']           * r_hip_pos        +
+            s['dof_pos_limits']    * r_dof_pos_limits +
+            s['collision']         * r_collision      +
+            s['contact']           * r_contact        +
+            s['feet_swing_height'] * r_feet_swing_height +
+            s['contact_no_vel']    * r_contact_no_vel +
+            s['alive']             * r_alive          +
+            s['dof_acc']           * r_dof_acc        +
+            s['action_rate']       * r_act_rate
         )
 
     # ------------------------------------------------------------------
     def _check_termination(self, contact_forces):
-        quat  = self.robot.get_quat()
-        pos   = self.robot.get_pos()
+        quat   = self.robot.get_quat()
         proj_g = self._q_inv_rotate(
-            quat,
-            torch.tensor([[0., 0., -1.]], device=self.device).expand(self.num_envs, -1),
+            quat, torch.tensor([[0.,0.,-1.]], device=self.device).expand(self.num_envs,-1)
         )
-        height_fail  = pos[:, 2] < 0.5
-        tilt_fail    = proj_g[:, 2] > -0.5
-        timeout      = self.episode_len_buf >= self.max_episode_length
-        # Terminate if pelvis touches ground
-        pelvis_contact = torch.norm(contact_forces[:, self.pelvis_link_idx, :], dim=-1) > 1.0
+        height_fail    = self.robot.get_pos()[:,2] < 0.5
+        tilt_fail      = proj_g[:,2] > -0.5
+        timeout        = self.episode_len_buf >= self.max_episode_length
+        pelvis_contact = torch.norm(contact_forces[:, self.pelvis_link_idx, :], dim=-1) > 1.
         return height_fail | tilt_fail | timeout | pelvis_contact

@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 *.log
 robot/meshes/
+run_*.sh
+shutdown_*.sh
+experiments.md

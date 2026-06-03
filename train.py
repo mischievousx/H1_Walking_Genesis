@@ -34,12 +34,35 @@ def latest_checkpoint(save_dir):
 
 
 def main():
-    resume   = '--resume' in sys.argv
-    save_dir = SAVE_DIR
-    tb_dir   = TB_DIR
+    resume      = '--resume' in sys.argv
+    resume_from = None
+    save_dir    = SAVE_DIR
+    tb_dir      = TB_DIR
+    ent_coef    = 0.003
+    rollout     = ROLLOUT_STEPS
     if '--save-dir' in sys.argv:
         save_dir = sys.argv[sys.argv.index('--save-dir') + 1]
         tb_dir   = save_dir.replace('checkpoints', 'runs')
+    if '--ent-coef' in sys.argv:
+        ent_coef = float(sys.argv[sys.argv.index('--ent-coef') + 1])
+    if '--rollout' in sys.argv:
+        rollout = int(sys.argv[sys.argv.index('--rollout') + 1])
+    if '--resume-from' in sys.argv:
+        resume_from = sys.argv[sys.argv.index('--resume-from') + 1]
+
+    import env as env_module
+    if '--dof-acc' in sys.argv:
+        env_module._REWARD_SCALES['dof_acc'] = float(sys.argv[sys.argv.index('--dof-acc') + 1])
+    if '--contact-no-vel' in sys.argv:
+        env_module._REWARD_SCALES['contact_no_vel'] = float(sys.argv[sys.argv.index('--contact-no-vel') + 1])
+    if '--action-rate' in sys.argv:
+        env_module._REWARD_SCALES['action_rate'] = float(sys.argv[sys.argv.index('--action-rate') + 1])
+    if '--ang-vel-xy' in sys.argv:
+        env_module._REWARD_SCALES['ang_vel_xy'] = float(sys.argv[sys.argv.index('--ang-vel-xy') + 1])
+    if '--feet-swing-height' in sys.argv:
+        env_module._REWARD_SCALES['feet_swing_height'] = float(sys.argv[sys.argv.index('--feet-swing-height') + 1])
+    if '--tracking-lin-vel' in sys.argv:
+        env_module._REWARD_SCALES['tracking_lin_vel'] = float(sys.argv[sys.argv.index('--tracking-lin-vel') + 1])
 
     os.makedirs(save_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=tb_dir)
@@ -51,16 +74,19 @@ def main():
         num_privileged_obs = env.num_privileged_obs,
         device             = 'cuda',
         lr                 = LR_INIT,
-        rollout_steps      = ROLLOUT_STEPS,
+        rollout_steps      = rollout,
         num_envs           = NUM_ENVS,
-        ent_coef           = 0.01,
+        ent_coef           = ent_coef,
     )
 
     start_update  = 1
     total_steps   = 0
     best_mean_rew = -float('inf')
 
-    if resume:
+    if resume_from:
+        ckpt = ppo.load(resume_from)
+        print(f"Loaded weights from {resume_from} (restarting counters)")
+    elif resume:
         ckpt_path = latest_checkpoint(save_dir)
         if ckpt_path:
             ckpt = ppo.load(ckpt_path)
@@ -88,7 +114,7 @@ def main():
     hidden = ppo.ac.init_hidden(NUM_ENVS, 'cuda')
 
     print(f"Training H1 walking (LSTM policy) | {NUM_ENVS} envs | "
-          f"{ROLLOUT_STEPS} steps/rollout | {N_UPDATES} updates total")
+          f"{rollout} steps/rollout | {N_UPDATES} updates total")
     print(f"TensorBoard: tensorboard --logdir {os.path.abspath(tb_dir)}")
 
     lr = LR_INIT
@@ -99,7 +125,7 @@ def main():
         ppo.start_rollout(hidden)
 
         ep_rew = 0.
-        for _ in range(ROLLOUT_STEPS):
+        for _ in range(rollout):
             with torch.no_grad():
                 action, log_prob, value, new_hidden = ppo.ac.act(obs, hidden, priv_obs)
 
@@ -117,7 +143,7 @@ def main():
             ep_rew      += reward.mean().item()
 
         metrics     = ppo.update(obs, hidden, priv_obs)
-        mean_ep_rew = ep_rew / ROLLOUT_STEPS
+        mean_ep_rew = ep_rew / rollout
 
         # Adaptive LR: adjust based on KL divergence (matches rsl_rl)
         kl = metrics.get('kl', 0.)
