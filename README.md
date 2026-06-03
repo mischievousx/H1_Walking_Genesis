@@ -1,13 +1,13 @@
-# H1 Walking RL Training
+# 🤖 H1 Walking RL Training
 
 Reinforcement learning training for Unitree H1 humanoid robot walking, using the Genesis physics simulator and PPO.
 
-## Requirements
+## ⚙️ Requirements
 
 - NVIDIA GPU with CUDA 12.x (tested on RTX 5090 32GB)
 - Conda
 
-## Environment Setup
+## 🛠️ Environment Setup
 
 ### 1. Create conda environment
 
@@ -34,7 +34,7 @@ pip install genesis-world==1.0.0
 pip install tensorboard imageio
 ```
 
-## Training
+## 🏃 Training
 
 Basic training with default parameters:
 
@@ -48,7 +48,7 @@ Logs are printed every 10 updates. TensorBoard:
 tensorboard --logdir runs
 ```
 
-### Experiment: dof_acc ablation
+### 🔬 Experiment: dof_acc ablation
 
 Three parallel runs comparing joint acceleration penalty strength. All other parameters identical.
 
@@ -84,7 +84,7 @@ Key reward scale changes vs. defaults:
 | `action_rate` | -0.01 | -0.03 |
 | `dof_acc` | -2.5e-7 | -1e-6 / -5e-6 / -1e-5 |
 
-## Visualization
+## 🎬 Visualization
 
 ```bash
 python play.py checkpoints/h1_walk_000060.pt
@@ -99,7 +99,7 @@ Options:
 | `--vx` | `1.0` | Commanded forward speed (m/s) |
 | `--cpu` | off | Use CPU backend |
 
-## Project Structure
+## 📁 Project Structure
 
 ```
 ├── train.py          # Training entry point
