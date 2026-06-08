@@ -1,5 +1,6 @@
 import os
 import sys
+import shutil
 import time
 import torch
 from torch.utils.tensorboard import SummaryWriter
@@ -172,19 +173,26 @@ def main():
     curriculum_stage = -1
 
     def apply_curriculum(update):
+        """Switch reward-scale multipliers / command ranges by training progress.
+        Returns the name of the stage that just ended (None if no transition) —
+        reward scales differ across stages, so absolute mean_ep_rew values aren't
+        comparable across them; the caller archives that stage's best checkpoint
+        and resets best-reward tracking accordingly."""
         nonlocal curriculum_stage
         if not use_curriculum:
-            return
+            return None
         progress  = update / N_UPDATES
         stage_idx = next(i for i, s in enumerate(CURRICULUM) if progress <= s[0])
         if stage_idx == curriculum_stage:
-            return
+            return None
+        ended_name = CURRICULUM[curriculum_stage][1] if curriculum_stage >= 0 else None
         curriculum_stage = stage_idx
         _, name, mult, vx_range, vy_range = CURRICULUM[stage_idx]
         env.set_curriculum(scale_mult=mult, cmd_vx_range=vx_range, cmd_vy_range=vy_range)
         print(f"[curriculum] update {update:5d}/{N_UPDATES} → stage '{name}'  "
               f"cmd_vx={vx_range}  cmd_vy={vy_range}  mult={mult}")
         writer.add_scalar('curriculum/stage_idx', stage_idx, total_steps)
+        return ended_name
 
     apply_curriculum(start_update)
 
@@ -202,7 +210,18 @@ def main():
     ppo.set_lr(lr)
 
     for update in range(start_update, N_UPDATES + 1):
-        apply_curriculum(update)
+        ended_stage = apply_curriculum(update)
+        if ended_stage is not None:
+            # Reward scales change between stages, so absolute mean_ep_rew values
+            # aren't comparable across them — keep "best" meaningful by archiving
+            # the outgoing stage's best checkpoint and restarting the comparison.
+            old_best = os.path.join(save_dir, 'h1_walk_best.pt')
+            if os.path.exists(old_best):
+                archive = os.path.join(save_dir, f'h1_walk_best_{ended_stage}.pt')
+                shutil.copy2(old_best, archive)
+                print(f"  → stage '{ended_stage}' ended (best_mean_rew={best_mean_rew:+.3f}); "
+                      f"archived its best checkpoint to {archive} and reset best-reward tracking")
+            best_mean_rew = -float('inf')
 
         # Snapshot hidden state at rollout start (needed for BPTT during update)
         ppo.start_rollout(hidden)
