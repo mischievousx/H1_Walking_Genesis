@@ -52,6 +52,7 @@ _REWARD_SCALES = {
     'contact_no_vel':   -0.2,
     'feet_swing_height':-20.0,
     'contact':           0.18,
+    'joint_sym':        -0.1,
 }
 
 RESAMPLE_INTERVAL = 500   # steps between command resamples (~10 s)
@@ -82,6 +83,13 @@ class H1WalkingEnv:
 
         # Reward scales × dt (matches Unitree _prepare_reward_function)
         self.scales = {k: v * self.dt for k, v in _REWARD_SCALES.items()}
+        # Snapshot of the base scales (post CLI-override, pre-curriculum) so that
+        # set_curriculum() can always recompute from a stable reference point.
+        self._base_reward_scales = dict(_REWARD_SCALES)
+
+        # Command sampling ranges — overridable per curriculum stage (see set_curriculum)
+        self.cmd_vx_range = (-1.0, 1.0)
+        self.cmd_vy_range = (-1.0, 1.0)
 
         self.commands       = torch.zeros(num_envs, 3, device=device)
         self.heading_target = torch.zeros(num_envs, device=device)
@@ -171,8 +179,10 @@ class H1WalkingEnv:
     # ------------------------------------------------------------------
     def _sample_commands(self, env_ids):
         n = len(env_ids)
-        vx = torch.rand(n, device=self.device) * 2.0 - 1.0   # [-1.0, 1.0] m/s
-        vy = torch.rand(n, device=self.device) * 2.0 - 1.0   # [-1.0, 1.0] m/s
+        vx_lo, vx_hi = self.cmd_vx_range
+        vy_lo, vy_hi = self.cmd_vy_range
+        vx = torch.rand(n, device=self.device) * (vx_hi - vx_lo) + vx_lo
+        vy = torch.rand(n, device=self.device) * (vy_hi - vy_lo) + vy_lo
         self.commands[env_ids, 0] = vx
         self.commands[env_ids, 1] = vy
         self.heading_target[env_ids] = (
@@ -192,6 +202,27 @@ class H1WalkingEnv:
         self.commands[:, 2] = torch.clamp(0.5 * err, -1., 1.)
         no_vel = torch.norm(self.commands[:, :2], dim=1) < 0.1
         self.commands[no_vel, 2] = 0.
+
+    # ------------------------------------------------------------------
+    def set_curriculum(self, scale_mult=None, cmd_vx_range=None, cmd_vy_range=None):
+        """Apply a curriculum stage (called from train.py between updates).
+
+        scale_mult   : dict {reward_name: multiplier}, applied on top of the
+                       base H1RoughCfg scale (× dt). Names absent from the dict
+                       default to a multiplier of 1.0 (i.e. unchanged).
+        cmd_vx_range : (lo, hi) override for forward/backward velocity command
+                       sampling, e.g. (0., 0.) forces stand-still commands.
+        cmd_vy_range : (lo, hi) override for lateral velocity command sampling.
+        """
+        if scale_mult is not None:
+            self.scales = {
+                k: v * self.dt * scale_mult.get(k, 1.0)
+                for k, v in self._base_reward_scales.items()
+            }
+        if cmd_vx_range is not None:
+            self.cmd_vx_range = cmd_vx_range
+        if cmd_vy_range is not None:
+            self.cmd_vy_range = cmd_vy_range
 
     def _push_robots(self):
         root_lin_dofs = torch.arange(0, 3, device=self.device)
@@ -351,6 +382,14 @@ class H1WalkingEnv:
         r_dof_acc  = torch.sum(dof_acc**2, dim=1)
         r_act_rate = torch.sum((actions - self.last_action)**2, dim=1)
 
+        # ── Left-right joint symmetry (pitch/knee/ankle velocity magnitude) ──
+        dof_vel = self.robot.get_dofs_velocity(self.motor_dofs)
+        r_joint_sym = (
+            (torch.abs(dof_vel[:,4]) - torch.abs(dof_vel[:,5]))**2 +  # hip pitch
+            (torch.abs(dof_vel[:,6]) - torch.abs(dof_vel[:,7]))**2 +  # knee
+            (torch.abs(dof_vel[:,8]) - torch.abs(dof_vel[:,9]))**2    # ankle
+        )
+
         return (
             s['tracking_lin_vel']  * r_tracking_lin  +
             s['tracking_ang_vel']  * r_tracking_ang  +
@@ -366,7 +405,8 @@ class H1WalkingEnv:
             s['contact_no_vel']    * r_contact_no_vel +
             s['alive']             * r_alive          +
             s['dof_acc']           * r_dof_acc        +
-            s['action_rate']       * r_act_rate
+            s['action_rate']       * r_act_rate       +
+            s['joint_sym']         * r_joint_sym
         )
 
     # ------------------------------------------------------------------

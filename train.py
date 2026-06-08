@@ -23,6 +23,62 @@ SAVE_DIR        = 'checkpoints_v4'
 TB_DIR          = 'runs_v4'
 # ──────────────────────────────────────────────────────────────────────────────
 
+# ── Curriculum: staged training ────────────────────────────────────────────────
+# 站立 (stand) → 走路跟指令 (walk & track) → 平滑 (smooth gait) → 速度跟踪 (speed)
+#
+# Each entry: (progress_upper_bound, stage_name, reward_scale_multipliers,
+#              cmd_vx_range, cmd_vy_range)
+# `progress` = update / N_UPDATES. The first stage whose bound >= progress is
+# active. Multipliers are applied on top of the base H1RoughCfg reward scales
+# (× dt); reward names absent from the dict keep multiplier 1.0 (unchanged).
+# Enable with --curriculum.
+CURRICULUM = [
+    # Stage 1 — 站立: zero-velocity commands, focus on balance/posture/survival.
+    # Gait-timing rewards (contact/swing) are de-emphasised since the robot is
+    # not expected to walk yet; tracking is trivially satisfied (cmd == 0).
+    (0.15, 'stand', {
+        'tracking_lin_vel':   0.3,
+        'tracking_ang_vel':   0.3,
+        'contact':            0.2,
+        'feet_swing_height':  0.2,
+        'contact_no_vel':     0.5,
+        'alive':              1.5,
+        'orientation':        1.3,
+        'base_height':        1.3,
+    }, (0., 0.), (0., 0.)),
+
+    # Stage 2 — 走路跟指令: restore command range, boost tracking reward so the
+    # robot prioritises following vx/vy/yaw commands; relax smoothness penalties
+    # so it can freely explore gaits while learning to move.
+    (0.50, 'walk_track', {
+        'tracking_lin_vel':   1.5,
+        'tracking_ang_vel':   1.5,
+        'feet_swing_height':  0.6,
+        'action_rate':        0.5,
+        'dof_acc':            0.5,
+        'joint_sym':          0.5,
+    }, (-1.0, 1.0), (-1.0, 1.0)),
+
+    # Stage 3 — 平滑: tracking is competent now, so shift weight onto smoothness
+    # / gait-quality penalties to refine the walking style.
+    (0.80, 'smooth', {
+        'action_rate':        2.0,
+        'dof_acc':            2.0,
+        'joint_sym':          2.0,
+        'contact_no_vel':     1.5,
+        'feet_swing_height':  1.5,
+    }, (-1.0, 1.0), (-1.0, 1.0)),
+
+    # Stage 4 — 速度跟踪: widen the command range (faster targets) and re-boost
+    # tracking so the policy learns to hit higher speeds precisely while
+    # retaining the smooth gait learned in stage 3.
+    (1.01, 'speed', {
+        'tracking_lin_vel':   1.5,
+        'tracking_ang_vel':   1.2,
+    }, (-1.5, 1.5), (-1.0, 1.0)),
+]
+# ──────────────────────────────────────────────────────────────────────────────
+
 
 def latest_checkpoint(save_dir):
     ckpts = [f for f in os.listdir(save_dir) if f.startswith('h1_walk_') and f.endswith('.pt')]
@@ -40,6 +96,7 @@ def main():
     tb_dir      = TB_DIR
     ent_coef    = 0.003
     rollout     = ROLLOUT_STEPS
+    use_curriculum = '--curriculum' in sys.argv
     if '--save-dir' in sys.argv:
         save_dir = sys.argv[sys.argv.index('--save-dir') + 1]
         tb_dir   = save_dir.replace('checkpoints', 'runs')
@@ -63,6 +120,10 @@ def main():
         env_module._REWARD_SCALES['feet_swing_height'] = float(sys.argv[sys.argv.index('--feet-swing-height') + 1])
     if '--tracking-lin-vel' in sys.argv:
         env_module._REWARD_SCALES['tracking_lin_vel'] = float(sys.argv[sys.argv.index('--tracking-lin-vel') + 1])
+    if '--orientation' in sys.argv:
+        env_module._REWARD_SCALES['orientation'] = float(sys.argv[sys.argv.index('--orientation') + 1])
+    if '--joint-sym' in sys.argv:
+        env_module._REWARD_SCALES['joint_sym'] = float(sys.argv[sys.argv.index('--joint-sym') + 1])
 
     os.makedirs(save_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=tb_dir)
@@ -107,6 +168,26 @@ def main():
             best_mean_rew = best_ckpt.get('best_mean_rew', -float('inf'))
             print(f"Best reward so far: {best_mean_rew:.3f}")
 
+    # ── Curriculum stage application (no-op unless --curriculum is passed) ──────
+    curriculum_stage = -1
+
+    def apply_curriculum(update):
+        nonlocal curriculum_stage
+        if not use_curriculum:
+            return
+        progress  = update / N_UPDATES
+        stage_idx = next(i for i, s in enumerate(CURRICULUM) if progress <= s[0])
+        if stage_idx == curriculum_stage:
+            return
+        curriculum_stage = stage_idx
+        _, name, mult, vx_range, vy_range = CURRICULUM[stage_idx]
+        env.set_curriculum(scale_mult=mult, cmd_vx_range=vx_range, cmd_vy_range=vy_range)
+        print(f"[curriculum] update {update:5d}/{N_UPDATES} → stage '{name}'  "
+              f"cmd_vx={vx_range}  cmd_vy={vy_range}  mult={mult}")
+        writer.add_scalar('curriculum/stage_idx', stage_idx, total_steps)
+
+    apply_curriculum(start_update)
+
     t0  = time.time() - total_steps / max(1, NUM_ENVS * 50)
     obs, priv_obs = env.reset()
 
@@ -121,6 +202,8 @@ def main():
     ppo.set_lr(lr)
 
     for update in range(start_update, N_UPDATES + 1):
+        apply_curriculum(update)
+
         # Snapshot hidden state at rollout start (needed for BPTT during update)
         ppo.start_rollout(hidden)
 

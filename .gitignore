@@ -8,3 +8,4 @@ robot/meshes/
 run_*.sh
 shutdown_*.sh
 experiments.md
+temp/
