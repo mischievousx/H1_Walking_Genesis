@@ -70,7 +70,7 @@ def get_obs(robot, last_action, commands, phase, device, obs_norm=None):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('checkpoint',             help='Path to .pt checkpoint')
-    parser.add_argument('--steps', type=int, default=600,  help='Simulation steps to record')
+    parser.add_argument('--steps', type=int, default=300,  help='Simulation steps to record')
     parser.add_argument('--out',   default='videos/play.mp4', help='Output video path')
     parser.add_argument('--vx',    type=float, default=0.5,   help='Commanded forward speed (m/s)')
     parser.add_argument('--vy',    type=float, default=0.0,   help='Commanded lateral speed (m/s)')

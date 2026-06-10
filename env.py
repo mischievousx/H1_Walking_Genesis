@@ -234,6 +234,7 @@ class H1WalkingEnv:
 
         self.last_action  = actions.clone()
         self.last_dof_vel = dof_vel_now.clone()
+        self.last_dof_acc = dof_acc.clone()
 
         done_ids = done.nonzero(as_tuple=False).flatten()
         if len(done_ids) > 0:
@@ -350,6 +351,24 @@ class H1WalkingEnv:
         # ── Smoothness ─────────────────────────────────────────────────────
         r_dof_acc  = torch.sum(dof_acc**2, dim=1)
         r_act_rate = torch.sum((actions - self.last_action)**2, dim=1)
+
+        self.last_reward_raw = {
+            'tracking_lin_vel':  r_tracking_lin,
+            'tracking_ang_vel':  r_tracking_ang,
+            'lin_vel_z':         r_lin_vel_z,
+            'ang_vel_xy':        r_ang_vel_xy,
+            'orientation':       r_orientation,
+            'base_height':       r_base_height,
+            'hip_pos':           r_hip_pos,
+            'dof_pos_limits':    r_dof_pos_limits,
+            'collision':         r_collision,
+            'contact':           r_contact,
+            'feet_swing_height': r_feet_swing_height,
+            'contact_no_vel':    r_contact_no_vel,
+            'alive':             r_alive,
+            'dof_acc':           r_dof_acc,
+            'action_rate':       r_act_rate,
+        }
 
         return (
             s['tracking_lin_vel']  * r_tracking_lin  +

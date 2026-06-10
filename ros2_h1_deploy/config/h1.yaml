@@ -1,0 +1,34 @@
+# H1 hardware configuration
+# Values must match the training environment (env.py / demo_sequence.py)
+
+# ── joint ordering in LowState.motor_state[] ──────────────────────────────
+# Verify against your H1 firmware version before deployment.
+# Standard H1 (original, "go" msg type):
+#   [0] L_hip_yaw   [1] L_hip_roll  [2] L_hip_pitch  [3] L_knee   [4] L_ankle
+#   [5] R_hip_yaw   [6] R_hip_roll  [7] R_hip_pitch  [8] R_knee   [9] R_ankle
+leg_motor_idx: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+# Waist yaw motor index (for IMU frame transform)
+waist_yaw_motor_idx: 12
+
+# ── default standing pose (rad) ─────────────────────────────────────────────
+# Must match DEFAULT_DOF in demo_sequence.py / env.py
+default_dof: [0.0, 0.0, 0.0, 0.0, -0.1,
+             -0.1, 0.3, 0.3, -0.2, -0.2]
+
+# ── PD gains ────────────────────────────────────────────────────────────────
+kp: [150, 150, 150, 150, 150, 150, 200, 200, 40, 40]
+kd: [  2,   2,   2,   2,   2,   2,   4,   4,  2,  2]
+
+# ── observation scaling ─────────────────────────────────────────────────────
+ang_vel_scale:  0.25
+dof_pos_scale:  1.0
+dof_vel_scale:  0.05
+action_scale:   0.25
+cmd_scale:      [2.0, 2.0, 0.25]   # [vx, vy, yaw_rate]
+
+# ── phase clock ─────────────────────────────────────────────────────────────
+phase_period:   0.8   # seconds (must match env.py)
+
+# ── control ─────────────────────────────────────────────────────────────────
+control_dt:     0.02  # 50 Hz

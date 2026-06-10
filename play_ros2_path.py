@@ -60,24 +60,23 @@ PHASE_PERIOD = 0.8
 VX_RAMP_RATE = 0.02
 YAW_GAIN     = 1.0
 
-SEGMENT_STEPS = 200          # every random segment lasts exactly this many control steps
-VX_RANGE      = (0.0, 0.5)   # commanded forward speed range (m/s)
-HEADING_RANGE = (-math.pi, math.pi)  # absolute heading target range (rad)
+# Deterministic route — mirrors demo_sequence.py's PHASES:
+# forward → left turn → forward → right turn → forward → stop.
+# Each entry: (steps, vx, vy, heading_target_rad, label)
+FIXED_ROUTE = [
+    (200, 0.5, 0.0, 0.0,        'Forward'),
+    (300, 0.4, 0.0, math.pi/2,  'Left turn'),
+    (200, 0.5, 0.0, math.pi/2,  'Forward'),
+    (300, 0.4, 0.0, 0.0,        'Right turn'),
+    (150, 0.5, 0.0, 0.0,        'Forward'),
+    (100, 0.0, 0.0, 0.0,        'Stop'),
+]
 
 
-def generate_random_phases(num_segments: int, seed: int = None):
-    """
-    Generate a sequence of random command segments, each SEGMENT_STEPS long.
-    Each segment: (steps, vx, vy, heading_target_rad, label)
-    """
-    rng = np.random.default_rng(seed)
-    phases = []
-    for i in range(num_segments):
-        vx      = float(rng.uniform(*VX_RANGE))
-        heading = float(rng.uniform(*HEADING_RANGE))
-        label   = f'Rand#{i}  vx={vx:.2f}  hd={math.degrees(heading):+.0f}°'
-        phases.append((SEGMENT_STEPS, vx, 0.0, heading, label))
-    return phases
+def generate_fixed_route():
+    """Return the deterministic square-loop command sequence (no RNG —
+    same route every run, useful for repeatable path-tracking evaluation)."""
+    return list(FIXED_ROUTE)
 
 
 # ── sim helpers ───────────────────────────────────────────────────────────────
@@ -301,10 +300,6 @@ def main():
     parser.add_argument('--checkpoint',
                         default='checkpoints/checkpoints_v4_r48s_acc5x/h1_walk_best.pt')
     parser.add_argument('--out', default='videos/ros2_path_closed_acc5x.mp4')
-    parser.add_argument('--num-segments', type=int, default=6,
-                        help='Number of random command segments (each %d steps)' % SEGMENT_STEPS)
-    parser.add_argument('--seed', type=int, default=None,
-                        help='Random seed for reproducible command sequences')
     parser.add_argument('--cpu', action='store_true')
     args = parser.parse_args()
 
@@ -312,12 +307,12 @@ def main():
     device  = 'cpu' if args.cpu else 'cuda'
     backend = gs.cpu if args.cpu else gs.cuda
 
-    phases      = generate_random_phases(args.num_segments, args.seed)
+    phases      = generate_fixed_route()
     total_steps = sum(p[0] for p in phases)
-    print(f'Random command sequence (seed={args.seed}, {args.num_segments} segments '
-          f'× {SEGMENT_STEPS} steps = {total_steps} steps):')
+    print(f'Fixed route ({len(phases)} phases, {total_steps} steps total):')
     for i, (steps, vx, vy, hd, label) in enumerate(phases):
-        print(f'  [{i}] {label}')
+        print(f'  [{i}] {label:<12s} {steps:4d} steps  '
+              f'vx={vx:.2f}  heading target {math.degrees(hd):+.0f}°')
 
     gs.init(backend=backend)
 
